@@ -41,11 +41,3 @@ Internal developer notes in this repo:
 
 - [`docs/architecture.md`](./docs/architecture.md): Architecture decisions and open questions
 - [`docs/governance-requirements.md`](./docs/governance-requirements.md): Validation rules from the governance framework
-
-## Project Lead
-
-Brandon Bach, brandon.bach44@gmail.com
-
-## License
-
-TBD; not yet published.
