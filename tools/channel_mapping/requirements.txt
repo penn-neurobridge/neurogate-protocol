@@ -1,0 +1,2 @@
+edf-reader
+numpy>=1.20
