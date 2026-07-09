@@ -9,10 +9,6 @@ annotations_extract_remove.py
 Usage:
     python3 annotations_extract_remove.py <input.edf> <output_dir>
 
-    python3 /Users/knix/Library/CloudStorage/Box-Box/NeuroGate_Protocol/annotations_extract_remove.py \
-    /Users/knix/Library/CloudStorage/Box-Box/data/HUP282.edf \
-    /Users/knix/Library/CloudStorage/Box-Box/NeuroGate_Protocol
-
 Example:
     python3 annotations_extract_remove.py \
         /Users/knix/Library/CloudStorage/Box-Box/data/HUP282.edf \
