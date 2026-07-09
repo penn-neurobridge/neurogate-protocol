@@ -8,11 +8,6 @@ annotations_extract_remove.py
 
 Usage:
     python3 annotations_extract_remove.py <input.edf> <output_dir>
-
-Example:
-    python3 annotations_extract_remove.py \
-        /Users/knix/Library/CloudStorage/Box-Box/data/HUP282.edf \
-        /Users/knix/Library/CloudStorage/Box-Box/NeuroGate_Protocol
 """
 
 import os
