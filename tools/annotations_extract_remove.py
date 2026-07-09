@@ -154,7 +154,7 @@ def process(input_path: str, base: str):
         None
     )
     if annot_idx is None:
-        print("\n⚠ No 'EDF Annotations' channel found — plain EDF, nothing to do.")
+        print("\n No 'EDF Annotations' channel found — plain EDF, nothing to do.")
         return
 
     annot_offset = sum(n_samp[i] * 2 for i in range(annot_idx))
@@ -206,8 +206,8 @@ def process(input_path: str, base: str):
     validate_annotations_removed(output_path, n_hdr, n_records,
                                   rec_bytes, annot_offset, annot_len)
 
-    print(f"\n✓ Clean EDF saved → {output_path}")
-    print("✓ Original file unchanged\n")
+    print(f"\n Clean EDF saved → {output_path}")
+    print(" Original file unchanged\n")
     print(f"  Version  : '{h['version']}'")
     print(f"  Patient  : '{h['patient']}'")
     print(f"  Date     : {h['startdate']}  Time: {h['starttime']}")
