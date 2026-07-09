@@ -119,9 +119,9 @@ def validate_annotations_removed(clean_edf_path: str, n_hdr: int, n_records: int
     print(f"  Annotations parsed from clean EDF    : {len(found)}")
 
     if non_zero == 0 and len(found) == 0:
-        print("✅ Validation passed — annotation channel is fully cleared\n")
+        print("Validation passed — annotation channel is fully cleared\n")
     else:
-        print("⚠ Validation FAILED — some annotation data may remain\n")
+        print("Validation FAILED — some annotation data may remain\n")
         for a in found:
             print(f"   {a}")
 
