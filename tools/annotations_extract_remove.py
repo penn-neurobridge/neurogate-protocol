@@ -12,7 +12,19 @@ Usage:
 
 import os
 import argparse
+import time
+import io
+import shutil
+from dataclasses import dataclass
+from edf_header_viz import print_header_summary, plot_header_summary
 
+import sys
+
+@dataclass
+class OutputPaths:
+    deidentified_dir: str
+    extracted_dir: str
+    qa_dir: str
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -21,7 +33,6 @@ def parse_args():
     parser.add_argument('input_edf',  help='Path to the input .edf file')
     parser.add_argument('output_dir', help='Directory to save outputs')
     return parser.parse_args()
-
 
 # ── EDF header parsers ────────────────────────────────────────────────────────
 
@@ -173,10 +184,10 @@ def validate_annotations_removed(clean_edf_path: str, n_hdr: int, n_records: int
     print(f"  Records matching exact expected shape : {n_records - len(malformed)}/{n_records}")
  
     if len(found) == 0 and not malformed:
-        print("Validation passed — all event annotations removed, time-keeping TALs preserved\n")
+        print("Validation passed — all event annotations removed, time-keeping TALs preserved")
         return True
     else:
-        print("Validation FAILED — some annotation data may remain\n")
+        print("Validation FAILED — some annotation data may remain")
         for a in found:
             print(f"   parsed leftover: {a}")
         for i in malformed:
@@ -236,123 +247,185 @@ def validate_header_anonymized(clean_edf_path: str):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def process(input_path: str, base: str):
-    txt_path    = base + '_annotations.txt'
-    output_path = base + '_no_annotations.edf'
-
-    print(f"\n→ Parsing header: {input_path}")
-
-    with open(input_path, 'rb') as f:
-        h              = read_main_header(f)
-        f.seek(256)    # always start of signal headers
-        labels, n_samp = read_signal_headers(f, h['n_signals'])
-        f.seek(0)
-        raw_header     = f.read(h['n_header_bytes'])
-
-    n_hdr     = h['n_header_bytes']
-    n_records = h['n_records']
-    rec_bytes = sum(n * 2 for n in n_samp)
-
-    print(f"  Signals  : {h['n_signals']}")
-    print(f"  Records  : {n_records}")
-    print(f"  Rec size : {rec_bytes:,} bytes")
-
-    # Find any EDF Annotations channel
-    annot_indices = [
-        i for i, lbl in enumerate(labels)
-        if 'EDF Annotations' in lbl or 'BDF Annotations' in lbl
-    ]
-    if not annot_indices:
-        print("\n No 'EDF Annotations' channel found — plain EDF, nothing to do.")
-        return
-
-   # Compute (offset, length) within a record for each annotation channel
-    annot_channels = []
-    for idx in annot_indices:
-        offset = sum(n_samp[i] * 2 for i in range(idx))
-        length = n_samp[idx] * 2
-        annot_channels.append((idx, offset, length))
-
-    print(f"  Annot ch : {len(annot_channels)} found — "
-          f"{', '.join(f'index {i} ({l} bytes/record)' for i, _, l in annot_channels)}")
-
-    # ── Step 2 : extract annotations ─────────────────────────────────────────
-    print("\n→ Extracting annotations (reading annot channel(s) only)...")
+class _Tee:
+    """Writes to multiple streams at once -- used to mirror console
+    output into a QA log file without losing the live printout."""
+    def __init__(self, *streams):
+        self.streams = streams
  
-    all_rows = []  # (channel_label, onset, duration, description)
-    with open(input_path, 'rb') as f:
-        for idx, offset, length in annot_channels:
-            channel_bytes = b''
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+ 
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+def process(input_path: str, patient_id: str, paths: OutputPaths):
+    overall_start = time.perf_counter()
+
+    txt_path    = os.path.join(paths.extracted_dir, f'{patient_id}_annotations.txt')
+    output_path = os.path.join(paths.deidentified_dir, f'{patient_id}_no_annotations.edf')
+
+    # Add log path
+    log_path = os.path.join(paths.qa_dir, f'{patient_id}_log.txt')
+    log_file = open(log_path, 'w', encoding='utf-8')
+    real_stdout = sys.stdout
+    sys.stdout = _Tee(real_stdout, log_file)
+
+    try:
+        # Confirm the file actually exists and is readable
+        print(f"\n→ Checking input file: {input_path}", flush=True)
+        if not os.path.exists(input_path):
+            print(f"  ABORTED — file does not exist: {input_path}\n")
+            return False
+        file_size = os.path.getsize(input_path)
+        print(f"  Found, size: {file_size:,} bytes", flush=True)
+
+        print(f"\n→ Parsing header: {input_path}")
+
+        with open(input_path, 'rb') as f:
+            h              = read_main_header(f)
+            f.seek(256)    # always start of signal headers
+            labels, n_samp = read_signal_headers(f, h['n_signals'])
+            f.seek(0)
+            raw_header     = f.read(h['n_header_bytes'])
+
+        n_hdr     = h['n_header_bytes']
+        n_records = h['n_records']
+        rec_bytes = sum(n * 2 for n in n_samp)
+
+        print(f"  Signals  : {h['n_signals']}")
+        print(f"  Records  : {n_records}")
+        print(f"  Rec size : {rec_bytes:,} bytes")
+
+        # Find any EDF Annotations channel
+        annot_indices = [
+            i for i, lbl in enumerate(labels)
+            if 'EDF Annotations' in lbl or 'BDF Annotations' in lbl
+        ]
+        if not annot_indices:
+            print("\n No 'EDF Annotations' channel found — plain EDF, nothing to do.")
+            return
+
+    # Compute (offset, length) within a record for each annotation channel
+        annot_channels = []
+        for idx in annot_indices:
+            offset = sum(n_samp[i] * 2 for i in range(idx))
+            length = n_samp[idx] * 2
+            annot_channels.append((idx, offset, length))
+
+        print(f"  Annot ch : {len(annot_channels)} found — "
+            f"{', '.join(f'index {i} ({l} bytes/record)' for i, _, l in annot_channels)}")
+
+        # ── Step 2 : extract annotations ─────────────────────────────────────────
+        print("\n→ Extracting annotations (reading annot channel(s) only)...")
+ 
+        channel_bytes = {idx: b'' for idx, _, _ in annot_channels}
+        with open(input_path, 'rb') as f:
+            f.seek(n_hdr)
+            start_time = time.perf_counter()
+            last_update = start_time
             for rec in range(n_records):
-                f.seek(n_hdr + rec * rec_bytes + offset)
-                channel_bytes += f.read(length)
+                record = f.read(rec_bytes)   # ONE sequential read per record, not per channel
+                for idx, offset, length in annot_channels:
+                    channel_bytes[idx] += record[offset:offset + length]
  
-            for onset, dur, desc in parse_tal(channel_bytes):
+                now = time.perf_counter()
+                if now - last_update >= 0.5 or rec == n_records - 1:
+                    pct = (rec + 1) / n_records * 100
+                    print(f"  {rec+1:>6}/{n_records}  ({pct:5.1f}%)", end='\r', flush=True)
+                    last_update = now
+        print()
+ 
+        all_rows = []  # (channel_label, onset, duration, description)
+        for idx, offset, length in annot_channels:
+            for onset, dur, desc in parse_tal(channel_bytes[idx]):
                 all_rows.append((f'{labels[idx]} [ch {idx}]', onset, dur, desc))
  
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write('channel\tonset_sec\tduration_sec\tdescription\n')
-        for channel, onset, dur, desc in all_rows:
-            f.write(f'{channel}\t{onset:.6f}\t{dur:.6f}\t{desc}\n')
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write('channel\tonset_sec\tduration_sec\tdescription\n')
+            for channel, onset, dur, desc in all_rows:
+                f.write(f'{channel}\t{onset:.6f}\t{dur:.6f}\t{desc}\n')
  
-    print(f"✓ {len(all_rows)} annotations saved → {txt_path}")
+        print(f"✓ {len(all_rows)} annotations saved → {txt_path}")
 
-    # ── Step 3 : anonymize header ─────────────────────────────────────────────
-    print("\n→ Anonymizing header (patient/recording/startdate)...")
-    anon_header = anonymize_header_bytes(raw_header)
-    print("✓ Header anonymized")
+        # ── Step 3 : anonymize header ─────────────────────────────────────────────
+        print("\n→ Anonymizing header (patient/recording/startdate)...")
+        anon_header = anonymize_header_bytes(raw_header)
+        print("✓ Header anonymized")
 
-    # ── Step 4 : write NEW clean EDF (original untouched) ────────────────────
-    print(f"\n→ Writing clean EDF → {output_path}")
-    print("  (streaming record-by-record, only annotation bytes replaced)")
+        anon_h = read_main_header(io.BytesIO(anon_header))
+        print_header_summary(anon_h, labels, n_samp)
+        plot_header_summary(anon_h, labels, n_samp,
+                        out_path=os.path.join(paths.qa_dir, f'{patient_id}_header.png'))
+
+        # ── Step 4 : write NEW clean EDF (original untouched) ────────────────────
+        print(f"\n→ Writing clean EDF → {output_path}")
+        print("  (streaming record-by-record, only annotation bytes replaced)")
+    
+        with open(input_path, 'rb') as src, open(output_path, 'wb') as dst:
+    
+            # Write anonymized header
+            dst.write(anon_header)
+    
+            # Stream records: keep only the mandatory time-keeping TAL per
+            # record, per annotation channel (spec-compliant), strip
+            # everything else (event text)
+            src.read(n_hdr)
+            start_time = time.perf_counter()
+            last_update = start_time
+            for rec in range(n_records):
+                record = bytearray(src.read(rec_bytes))
+                for idx, offset, length in annot_channels:
+                    orig_annot = bytes(record[offset : offset + length])
+                    onset = extract_record_onset(orig_annot)
+                    record[offset : offset + length] = build_timekeeping_tal(onset, length)
+                dst.write(record)
+                
+                now = time.perf_counter()
+                if now - last_update >= 0.5 or rec == n_records - 1:
+                    pct = (rec + 1) / n_records * 100
+                    elapsed = now - start_time
+                    print(f"  {rec+1:>6}/{n_records}  ({pct:5.1f}%)  "
+                          f"elapsed {elapsed:6.1f}s", end='\r', flush=True)
+                    last_update = now
+            print()  # move off the \r line once the loop is done
+            print(f"  Done in {time.perf_counter() - start_time:.1f}s")
+
+        # ── Validate ──────────────────────────────────────────────────────────────
+        ann_ok = all(
+            validate_annotations_removed(output_path, n_hdr, n_records, rec_bytes, offset, length)
+            for _, offset, length in annot_channels
+        )
+        hdr_ok  = validate_header_anonymized(output_path)
  
-    with open(input_path, 'rb') as src, open(output_path, 'wb') as dst:
- 
-        # Write anonymized header
-        dst.write(anon_header)
- 
-        # Stream records: keep only the mandatory time-keeping TAL per
-        # record, per annotation channel (spec-compliant), strip
-        # everything else (event text)
-        src.read(n_hdr)
-        for rec in range(n_records):
-            record = bytearray(src.read(rec_bytes))
-            for idx, offset, length in annot_channels:
-                orig_annot = bytes(record[offset : offset + length])
-                onset = extract_record_onset(orig_annot)
-                record[offset : offset + length] = build_timekeeping_tal(onset, length)
-            dst.write(record)
- 
-            if rec % 1000 == 0:
-                pct = rec / n_records * 100
-                print(f"  {rec:>6}/{n_records}  ({pct:.1f}%)", end='\r')
+        return ann_ok and hdr_ok
 
-    # ── Validate ──────────────────────────────────────────────────────────────
-    ann_ok = all(
-        validate_annotations_removed(output_path, n_hdr, n_records, rec_bytes, offset, length)
-        for _, offset, length in annot_channels
-    )
-    hdr_ok  = validate_header_anonymized(output_path)
+    finally:
+        # Always restore stdout and close the log file, even if we aborted early or hit an unexpected exception.
+        print(f"\n Total time: {time.perf_counter() - overall_start:.1f}s")
 
-    print(f"\n Clean EDF saved → {output_path}")
-    print(" Original file unchanged\n")
-    print(f"  Version  : '{h['version']}'")
-    print(f"  Patient  : '{h['patient']}'")
-    print(f"  Date     : {h['startdate']}  Time: {h['starttime']}")
-    print(f"  Hdr bytes: {h['n_header_bytes']}")
-    print(f"  Records  : {h['n_records']}")
-    print(f"  Signals  : {h['n_signals']}")
-
-    return ann_ok and hdr_ok
+        sys.stdout = real_stdout
+        log_file.close()
 
 if __name__ == '__main__':
     args = parse_args()
-    
-    # patient name derived from EDF filename (e.g. HUP282)
+
     patient_id  = os.path.splitext(os.path.basename(args.input_edf))[0]
     patient_dir = os.path.join(args.output_dir, patient_id)
-    
-    os.makedirs(patient_dir, exist_ok=True)
-    
-    base = os.path.join(patient_dir, patient_id)
-    process(args.input_edf, base)
+
+    original_dir = os.path.join(patient_dir, 'Original')
+    paths = OutputPaths(
+        deidentified_dir = os.path.join(patient_dir, 'Deidentified'),
+        extracted_dir    = os.path.join(patient_dir, 'Extracted'),
+        qa_dir           = os.path.join(patient_dir, 'QA'),
+    )
+    for d in (original_dir, paths.deidentified_dir, paths.extracted_dir, paths.qa_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # original_copy = os.path.join(original_dir, os.path.basename(args.input_edf))
+    # if not os.path.exists(original_copy):
+    #     shutil.copy2(args.input_edf, original_copy)
+
+    process(args.input_edf, patient_id, paths)
