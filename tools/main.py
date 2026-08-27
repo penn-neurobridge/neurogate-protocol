@@ -22,7 +22,8 @@ import sys
 import time
 from dataclasses import dataclass
 
-from edf_header import parse_header, anonymize_main_header_bytes, find_annotation_channels, EdfHeader
+from edf_header import (parse_header, anonymize_main_header_bytes, find_annotation_channels,
+                         EdfHeader, parse_recording_start_datetime, onset_to_datetime)
 import edf_header as edf_header_mod
 from edf_records import process_records
 from edf_qa import build_report
@@ -128,11 +129,18 @@ def process(input_path: str, patient_id: str, paths: OutputPaths) -> bool:
     for line in pass_result.timings.as_report_lines(pass_result.elapsed_sec):
         logger.info(line)
 
+    start_dt = parse_recording_start_datetime(original_header.main)
+    if start_dt is None:
+        logger.info("Recording start date/time could not be parsed -- "
+                     "'clock_datetime' column will be blank.")
+
     with open(annotations_csv_path, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['channel', 'onset_sec', 'duration_sec', 'description'])
-        for channel, onset, dur, desc in pass_result.annotations:
-            writer.writerow([channel, f'{onset:.6f}', f'{dur:.6f}', desc])
+        writer.writerow(['channel_name', 'channel_number', 'onset_sec',
+                          'clock_datetime', 'duration_sec', 'description'])
+        for chan_idx, chan_label, onset, dur, desc in pass_result.annotations:
+            clock_str = onset_to_datetime(start_dt, onset).strftime('%Y-%m-%d %H:%M:%S') if start_dt else ''
+            writer.writerow([chan_label, chan_idx, f'{onset:.6f}', clock_str, f'{dur:.6f}', desc])
     logger.info(f"Annotations saved -> {annotations_csv_path}")
 
     report_text = build_report(

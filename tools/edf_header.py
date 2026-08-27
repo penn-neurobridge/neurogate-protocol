@@ -14,6 +14,7 @@ per the EDF spec -- including numeric fields like record count.
 """
 
 from __future__ import annotations
+import datetime as _dt
 from dataclasses import dataclass, field
 
 
@@ -157,6 +158,29 @@ def parse_header(f) -> EdfHeader:
 
 def record_bytes_per_signal(signals: list[SignalHeader]) -> list[int]:
     return [s.n_samples * 2 for s in signals]
+
+
+def parse_recording_start_datetime(main: MainHeader) -> _dt.datetime | None:
+    """
+    Parses the EDF startdate ('dd.mm.yy') and starttime ('hh.mm.ss')
+    fields into a real datetime. Two-digit year is ambiguous by spec;
+    standard convention (also used by EDFlib etc.): year >= 85 -> 19xx,
+    else 20xx. Returns None if the fields don't parse (e.g. already
+    anonymized to 01.01.01, or malformed).
+    """
+    try:
+        dd, mm, yy = (int(x) for x in main.startdate.split('.'))
+        hh, mi, ss = (int(x) for x in main.starttime.split('.'))
+        year = 1900 + yy if yy >= 85 else 2000 + yy
+        return _dt.datetime(year, mm, dd, hh, mi, ss)
+    except (ValueError, TypeError):
+        return None
+
+
+def onset_to_datetime(start: _dt.datetime, onset_sec: float) -> _dt.datetime:
+    """Recording start datetime + an onset offset in seconds -> the
+    actual clock datetime of that event."""
+    return start + _dt.timedelta(seconds=onset_sec)
 
 
 def find_annotation_channels(signals: list[SignalHeader]) -> list[int]:
