@@ -42,7 +42,36 @@ def parse_args():
     )
     parser.add_argument('input_edf', help='Path to the input .edf file')
     parser.add_argument('output_dir', help='Directory to save outputs')
+    parser.add_argument(
+        '--annotation-channels', type=str, default=None,
+        help=("Comma-separated channel indices (see the QA report's CHANNEL LIST) "
+              "to treat as annotation channels IN ADDITION to whatever is auto-detected "
+              "by label. Use this if the QA report's 'UNRECOGNIZED ANNOTATION-LIKE "
+              "CHANNELS' section flags a real annotation channel that wasn't auto-detected. "
+              "Example: --annotation-channels 3,7")
+    )
     return parser.parse_args()
+
+
+def _parse_extra_channel_indices(raw: str | None, n_signals: int, logger) -> list[int]:
+    if not raw:
+        return []
+    indices = []
+    for part in raw.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            idx = int(part)
+        except ValueError:
+            logger.warning(f"--annotation-channels: ignoring non-integer value {part!r}")
+            continue
+        if not (0 <= idx < n_signals):
+            logger.warning(f"--annotation-channels: ignoring out-of-range index {idx} "
+                            f"(file has {n_signals} channels, valid range 0-{n_signals - 1})")
+            continue
+        indices.append(idx)
+    return indices
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -73,7 +102,8 @@ def build_anonymized_header(original: EdfHeader) -> EdfHeader:
     return EdfHeader(main=anon_main, signals=original.signals, raw_bytes=anon_raw)
 
 
-def process(input_path: str, patient_id: str, paths: OutputPaths) -> bool:
+def process(input_path: str, patient_id: str, paths: OutputPaths,
+            extra_channels_raw: str | None = None) -> bool:
     overall_start = time.perf_counter()
 
     output_edf_path = os.path.join(paths.deidentified_dir, f'{patient_id}_no_annotations.edf')
@@ -97,13 +127,20 @@ def process(input_path: str, patient_id: str, paths: OutputPaths) -> bool:
                 f"Records: {original_header.main.n_records}, "
                 f"Header bytes: {original_header.main.n_header_bytes}")
 
-    annot_indices = find_annotation_channels(original_header.signals)
+    auto_indices = find_annotation_channels(original_header.signals)
+    manual_indices = _parse_extra_channel_indices(
+        extra_channels_raw, original_header.main.n_signals, logger)
+    manual_indices = [i for i in manual_indices if i not in auto_indices]
+    annot_indices = sorted(set(auto_indices) | set(manual_indices))
+
     if not annot_indices:
         logger.info("No 'EDF Annotations' channel found — plain EDF, nothing to strip. "
                      "Header PHI fields were not anonymized.")
         return False
 
-    logger.info(f"Annotation channel(s): {annot_indices}")
+    logger.info(f"Annotation channel(s): {annot_indices} "
+                f"(auto-detected: {auto_indices}"
+                + (f", manually specified: {manual_indices}" if manual_indices else "") + ")")
 
     anonymized_header = build_anonymized_header(original_header)
 
@@ -124,8 +161,7 @@ def process(input_path: str, patient_id: str, paths: OutputPaths) -> bool:
     print()  # move off the \r line
 
     logger.info(f"Pass complete in {pass_result.elapsed_sec:.1f}s — "
-                f"{len(pass_result.annotations)} annotations extracted, "
-                f"{len(pass_result.printable_findings)} printable-ASCII finding(s)")
+                f"{len(pass_result.annotations)} annotations extracted")
     for line in pass_result.timings.as_report_lines(pass_result.elapsed_sec):
         logger.info(line)
 
@@ -153,6 +189,7 @@ def process(input_path: str, patient_id: str, paths: OutputPaths) -> bool:
         annotations_csv_path=annotations_csv_path,
         output_edf_path=output_edf_path,
         total_runtime_sec=time.perf_counter() - overall_start,
+        manual_annot_indices=manual_indices,
     )
     with open(qa_report_path, 'w', encoding='utf-8') as f:
         f.write(report_text)
@@ -177,5 +214,5 @@ if __name__ == '__main__':
     for d in (paths.deidentified_dir, paths.extracted_dir, paths.qa_dir):
         os.makedirs(d, exist_ok=True)
 
-    ok = process(args.input_edf, patient_id, paths)
+    ok = process(args.input_edf, patient_id, paths, extra_channels_raw=args.annotation_channels)
     sys.exit(0 if ok else 1)

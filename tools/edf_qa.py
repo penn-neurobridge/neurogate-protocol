@@ -46,7 +46,9 @@ def build_report(
     annotations_csv_path: str,
     output_edf_path: str,
     total_runtime_sec: float,
+    manual_annot_indices: list[int] | None = None,
 ) -> str:
+    manual_annot_indices = manual_annot_indices or []
     lines = []
     w = lines.append
 
@@ -75,12 +77,19 @@ def build_report(
     chan_list_rows = []
     for i, s in enumerate(original_header.signals):
         rate = s.n_samples / dur if dur else 0
-        flagged = 'YES' if i in annot_indices else 'no'
+        if i in manual_annot_indices:
+            flagged = 'YES (manual)'
+        elif i in annot_indices:
+            flagged = 'YES (auto)'
+        else:
+            flagged = 'no'
         chan_list_rows.append([str(i), s.label, str(s.n_samples), f"{rate:.2f}", flagged])
     for line in _fmt_dynamic_table(['#', 'Label', 'Samples/rec', 'Rate (Hz)', 'Annotation?'], chan_list_rows):
         w(line)
     w("")
-    w(f"  -> {len(annot_indices)} channel(s) identified as annotation channels.")
+    w(f"  -> {len(annot_indices)} channel(s) identified as annotation channels "
+      f"({len(annot_indices) - len(manual_annot_indices)} auto-detected, "
+      f"{len(manual_annot_indices)} manually specified via --annotation-channels).")
     w(f"     Review the full list above for any unexpected or unrecognized")
     w(f"     channel labels that were NOT flagged but perhaps should be.")
     w("")
