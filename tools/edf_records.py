@@ -2,39 +2,28 @@
 edf_records.py
 
 Single combined streaming pass over EDF record data: extracts and
-removes annotation event text, computes an integrity hash, and runs a
-text-leak scan. See README.md for design rationale.
+removes annotation event text and computes an integrity hash. See
+README.md for design rationale.
 """
 
 from __future__ import annotations
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
-
-import numpy as np
 
 from edf_header import EdfHeader, record_bytes_per_signal
 
 
-PRINTABLE_RUN_THRESHOLD = 20
-
-# Accepted "text-like" character set: letters, digits, space, . , - / : '
-# See README.md for rationale.
-_TEXT_LIKE_CHARS = (
-    set(range(ord('A'), ord('Z') + 1)) |
-    set(range(ord('a'), ord('z') + 1)) |
-    set(range(ord('0'), ord('9') + 1)) |
-    {ord(c) for c in " .,-/:'"}
-)
-_IS_TEXT_LIKE = np.zeros(256, dtype=bool)
-_IS_TEXT_LIKE[list(_TEXT_LIKE_CHARS)] = True
-
 PROGRESS_INTERVAL_SEC = 0.5
 
-# Records are batched into buffers of this size before each scan call.
-# See README.md for why.
-SCAN_BATCH_RECORDS = 500
-
+# Structural check for unrecognized TAL-like channels: a real EDF+
+# annotation channel's records must start with onset[,duration]\x14 --
+# checked on the first N records only (mandatory in every record, so a
+# small sample is as informative as the whole file; see DESIGN.md).
+TAL_START_PATTERN = re.compile(rb'^[+-]\d+(\.\d+)?(\x15\d+(\.\d+)?)?\x14')
+TAL_SAMPLE_N_RECORDS = 20
+TAL_SAMPLE_MATCH_FRACTION = 0.9  # flag if >= this fraction of sampled records match
 
 
 @dataclass
@@ -46,16 +35,6 @@ class AnnotationChannel:
 
 
 @dataclass
-class PrintableRunFinding:
-    record_index: int
-    byte_offset: int      # offset within the record's non-annotation bytes
-    length: int
-    preview: str
-    channel_index: int = -1
-    channel_label: str = "?"
-
-
-@dataclass
 class StageTimings:
     """Cumulative time spent in each sub-operation of the combined pass,
     in seconds. Lets you see whether I/O, hashing, or scanning is the
@@ -63,12 +42,11 @@ class StageTimings:
     read_sec: float = 0.0
     annotation_sec: float = 0.0   # extract + build replacement TAL
     hash_sec: float = 0.0
-    scan_sec: float = 0.0
     write_sec: float = 0.0
 
     @property
     def total_sec(self) -> float:
-        return self.read_sec + self.annotation_sec + self.hash_sec + self.scan_sec + self.write_sec
+        return self.read_sec + self.annotation_sec + self.hash_sec + self.write_sec
 
     def as_report_lines(self, wall_clock_sec: float) -> list[str]:
         lines = []
@@ -77,7 +55,6 @@ class StageTimings:
             ('Read (disk)', self.read_sec),
             ('Annotation extract/rebuild', self.annotation_sec),
             ('Integrity hashing', self.hash_sec),
-            ('Text-like-character scan', self.scan_sec),
             ('Write (disk)', self.write_sec),
         ]:
             pct = (val / wall_clock_sec * 100) if wall_clock_sec else 0
@@ -90,8 +67,7 @@ class StageTimings:
 
 @dataclass
 class PassResult:
-    annotations: list[tuple]                     # (channel_label, onset, dur, desc)
-    printable_findings: list[PrintableRunFinding]
+    annotations: list[tuple]                     # (channel_index, channel_label, onset, dur, desc)
     hash_original_hex: str
     hash_output_hex: str
     hashes_match: bool
@@ -102,6 +78,10 @@ class PassResult:
     # keyed by channel index -- kept so the QA report can independently
     # re-validate the clean TAL shape without re-reading the file.
     channel_raw_output: dict = field(default_factory=dict)
+    # Structural TAL-sample match fraction per channel index -- flags
+    # channels that structurally resemble a real annotation channel but
+    # weren't recognized by label.
+    tal_sample_match: dict = field(default_factory=dict)
 
 
 def _annotation_channels(header: EdfHeader, annot_indices: list[int]) -> list[AnnotationChannel]:
@@ -180,142 +160,34 @@ def _non_annotation_mask_bytes(record: bytes, annot_ranges: list[tuple[int, int]
     return b''.join(pieces)
 
 
-def _scan_buffer_raw(chunk: bytes) -> list[tuple[int, int, str]]:
-    """Vectorized scan for runs of >= PRINTABLE_RUN_THRESHOLD consecutive
-    text-like bytes. Returns (start_offset, length, preview) tuples;
-    record/channel attribution is added by the caller (_ScanBatch)."""
-    if not chunk:
-        return []
 
-    arr = np.frombuffer(chunk, dtype=np.uint8)
-    mask = _IS_TEXT_LIKE[arr]
-
-    padded = np.concatenate(([False], mask, [False]))
-    diff = np.diff(padded.astype(np.int8))
-    starts = np.flatnonzero(diff == 1)
-    ends = np.flatnonzero(diff == -1)  # exclusive
-    lengths = ends - starts
-
-    long_enough = lengths >= PRINTABLE_RUN_THRESHOLD
-    starts = starts[long_enough]
-    ends = ends[long_enough]
-    lengths = lengths[long_enough]
-
-    results = []
-    for s, e, run_len in zip(starts.tolist(), ends.tolist(), lengths.tolist()):
-        run_bytes = chunk[s:e]
-        if len(set(run_bytes)) <= 1:
-            continue  # single repeated byte -- not text
-        if _is_periodic_plateau(run_bytes):
-            continue  # signal plateau artifact -- not text
-        preview = run_bytes.decode('ascii', errors='replace')
-        results.append((s, run_len, preview))
-    return results
-
-
-def _is_periodic_plateau(run_bytes: bytes) -> bool:
-    """True if every even- or every odd-position byte in run_bytes is a
-    single constant value (signature of a 2-byte sample sitting at a
-    fixed amplitude -- see README.md)."""
-    if len(run_bytes) < 6:
-        return False
-    even_phase = run_bytes[0::2]
-    odd_phase = run_bytes[1::2]
-    return len(set(even_phase)) <= 1 or len(set(odd_phase)) <= 1
-
-
-def _build_piece_map(rec_bytes: int, annot_ranges: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
+def structural_tal_sample_check(input_path: str, header: EdfHeader,
+                                 all_channels: list[AnnotationChannel]) -> dict:
     """
-    Non-annotation bytes for one record are the record's bytes with the
-    annotation-channel ranges cut out (see _non_annotation_mask_bytes).
-    This describes, for that same record, how a position in the
-    resulting "gaps removed" byte stream maps back to a position in
-    the original, full record layout -- i.e. which real channel it
-    falls in. Returns a list of (piece_start_in_non_annot_bytes,
-    corresponding_start_in_full_record, length), one entry per
-    contiguous stretch of non-annotation bytes.
+    Reads only the first TAL_SAMPLE_N_RECORDS records and checks, per
+    channel, what fraction start with a valid TAL onset+delimiter
+    pattern. A real annotation channel matches on effectively every
+    record, by spec; ordinary signal data essentially never does. Cheap
+    -- fixed-size read regardless of file size, no full-file pass needed.
+    Returns {channel_index: match_fraction}.
     """
-    pieces = []
-    cursor = 0
-    piece_pos = 0
-    for start, end in sorted(annot_ranges):
-        if start > cursor:
-            length = start - cursor
-            pieces.append((piece_pos, cursor, length))
-            piece_pos += length
-        cursor = max(cursor, end)
-    if cursor < rec_bytes:
-        pieces.append((piece_pos, cursor, rec_bytes - cursor))
-    return pieces
+    n_hdr = header.main.n_header_bytes
+    rec_bytes = sum(c.length for c in all_channels)
+    n_sample = min(TAL_SAMPLE_N_RECORDS, header.main.n_records)
 
+    with open(input_path, 'rb') as f:
+        f.seek(n_hdr)
+        sample = f.read(n_sample * rec_bytes)
 
-def _non_annot_offset_to_channel(non_annot_offset: int, piece_map: list[tuple[int, int, int]],
-                                  all_channels: list[AnnotationChannel]) -> AnnotationChannel | None:
-    """Maps an offset within one record's non-annotation byte stream
-    back to which real channel (by full-record byte offset) it falls
-    in. all_channels here means every signal channel, not just the
-    annotation ones -- reusing the AnnotationChannel shape since it's
-    just (index, label, offset, length)."""
-    record_offset = non_annot_offset
-    for piece_start, rec_start, length in piece_map:
-        if piece_start <= non_annot_offset < piece_start + length:
-            record_offset = rec_start + (non_annot_offset - piece_start)
-            break
-    for ch in all_channels:
-        if ch.offset <= record_offset < ch.offset + ch.length:
-            return ch
-    return None
-
-
-class _ScanBatch:
-    """Batches non-annotation bytes across records, scans once per
-    batch, and maps findings back to a record index, offset, and
-    channel. See README.md for the batching rationale. Edge case: a run
-    straddling two records is attributed to the record it starts in."""
-    def __init__(self, piece_map: list[tuple[int, int, int]], all_channels: list[AnnotationChannel],
-                 batch_records: int = SCAN_BATCH_RECORDS):
-        self.piece_map = piece_map
-        self.all_channels = all_channels
-        self.batch_records = batch_records
-        self._buffer = bytearray()
-        self._record_starts: list[int] = []   # buffer offset each record began at
-        self._record_indices: list[int] = []  # record_index for each entry above
-        self._records_in_batch = 0
-
-    def add(self, record_index: int, chunk: bytes) -> list[PrintableRunFinding]:
-        self._record_starts.append(len(self._buffer))
-        self._record_indices.append(record_index)
-        self._buffer += chunk
-        self._records_in_batch += 1
-        if self._records_in_batch >= self.batch_records:
-            return self.flush()
-        return []
-
-    def flush(self) -> list[PrintableRunFinding]:
-        if not self._buffer:
-            return []
-        raw = _scan_buffer_raw(bytes(self._buffer))
-        findings = [self._attribute(s, length, preview) for s, length, preview in raw]
-        self._buffer = bytearray()
-        self._record_starts = []
-        self._record_indices = []
-        self._records_in_batch = 0
-        return findings
-
-    def _attribute(self, buffer_offset: int, length: int, preview: str) -> PrintableRunFinding:
-        import bisect
-        i = bisect.bisect_right(self._record_starts, buffer_offset) - 1
-        i = max(i, 0)
-        record_index = self._record_indices[i]
-        rel_offset = buffer_offset - self._record_starts[i]
-
-        ch = _non_annot_offset_to_channel(rel_offset, self.piece_map, self.all_channels)
-        channel_index = ch.index if ch else -1
-        channel_label = ch.label if ch else "?"
-
-        return PrintableRunFinding(record_index=record_index, byte_offset=rel_offset,
-                                    length=length, preview=preview,
-                                    channel_index=channel_index, channel_label=channel_label)
+    match_fractions = {}
+    for c in all_channels:
+        matches = 0
+        for i in range(n_sample):
+            chunk = sample[i * rec_bytes + c.offset: i * rec_bytes + c.offset + c.length]
+            if TAL_START_PATTERN.match(chunk):
+                matches += 1
+        match_fractions[c.index] = matches / n_sample if n_sample else 0.0
+    return match_fractions
 
 
 def process_records(input_path: str, output_path: str, header: EdfHeader,
@@ -323,7 +195,9 @@ def process_records(input_path: str, output_path: str, header: EdfHeader,
     """
     The single combined streaming pass. Reads input_path record-by-record,
     writes the de-identified version to output_path, and accumulates
-    annotations, integrity hashes, and printable-run findings along the way.
+    annotations and integrity hashes along the way. The structural
+    TAL-sample check is run separately, since it only needs the first
+    few records.
 
     progress_cb(records_done, total_records, elapsed_sec), if given, is
     called periodically (not more than every PROGRESS_INTERVAL_SEC).
@@ -336,15 +210,11 @@ def process_records(input_path: str, output_path: str, header: EdfHeader,
     annot_channels = _annotation_channels(header, annot_indices)
     annot_ranges = [(c.offset, c.offset + c.length) for c in annot_channels]
 
-    # Full channel list (every signal, not just annotation ones) -- used
-    # to resolve which channel a scan finding actually falls in.
+    # Full channel list (every signal, not just annotation ones).
     all_channels = _annotation_channels(header, list(range(len(header.signals))))
-    piece_map = _build_piece_map(rec_bytes, annot_ranges)
 
     channel_raw = {c.index: bytearray() for c in annot_channels}
     channel_raw_output = {c.index: bytearray() for c in annot_channels}
-    printable_findings: list[PrintableRunFinding] = []
-    scan_batch = _ScanBatch(piece_map=piece_map, all_channels=all_channels)
     hash_orig = hashlib.blake2b()
     hash_out = hashlib.blake2b()
 
@@ -382,38 +252,27 @@ def process_records(input_path: str, output_path: str, header: EdfHeader,
             t3 = time.perf_counter()
             timings.hash_sec += t3 - t2
 
-            # Printable-ASCII leak scan: add to the batch, only actually
-            # scans (numpy call) once every SCAN_BATCH_RECORDS records.
-            printable_findings.extend(scan_batch.add(rec, orig_non_annot))
-            t4 = time.perf_counter()
-            timings.scan_sec += t4 - t3
-
             dst.write(out_record)
-            t5 = time.perf_counter()
-            timings.write_sec += t5 - t4
+            t4 = time.perf_counter()
+            timings.write_sec += t4 - t3
 
-            now = t5
+            now = t4
             if progress_cb and (now - last_update >= PROGRESS_INTERVAL_SEC or rec == n_records - 1):
                 progress_cb(rec + 1, n_records, now - start)
                 last_update = now
 
-        # Flush any remaining partial batch (fewer than SCAN_BATCH_RECORDS
-        # records left over at end of file).
-        t_flush0 = time.perf_counter()
-        printable_findings.extend(scan_batch.flush())
-        timings.scan_sec += time.perf_counter() - t_flush0
-
     annotations = []
     for c in annot_channels:
         for onset, dur, desc in parse_tal(bytes(channel_raw[c.index])):
-            annotations.append((f'{c.label} [ch {c.index}]', onset, dur, desc))
+            annotations.append((c.index, c.label, onset, dur, desc))
 
     hash_orig_hex = hash_orig.hexdigest()
     hash_out_hex = hash_out.hexdigest()
 
+    tal_sample_match = structural_tal_sample_check(input_path, header, all_channels)
+
     return PassResult(
         annotations=annotations,
-        printable_findings=printable_findings,
         hash_original_hex=hash_orig_hex,
         hash_output_hex=hash_out_hex,
         hashes_match=(hash_orig_hex == hash_out_hex),
@@ -421,6 +280,7 @@ def process_records(input_path: str, output_path: str, header: EdfHeader,
         elapsed_sec=time.perf_counter() - start,
         timings=timings,
         channel_raw_output={k: bytes(v) for k, v in channel_raw_output.items()},
+        tal_sample_match=tal_sample_match,
     )
 
 

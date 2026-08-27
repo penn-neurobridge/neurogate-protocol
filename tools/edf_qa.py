@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from edf_header import EdfHeader, MainHeader, SignalHeader, validate_header_anonymized
-from edf_records import PassResult, PRINTABLE_RUN_THRESHOLD, validate_tal_shape
+from edf_records import PassResult, validate_tal_shape, TAL_SAMPLE_N_RECORDS, TAL_SAMPLE_MATCH_FRACTION
 
 
 SEP = "=" * 78
@@ -153,27 +153,30 @@ def build_report(
     w(f"  Result          : {'MATCH' if pass_result.hashes_match else 'MISMATCH -- INVESTIGATE'}")
     w("")
 
-    # ── 6. Printable-ASCII scan findings ────────────────────────────────────
+    # ── 6. Unrecognized annotation-like channels ────────────────────────────
     w(SUBSEP)
-    w(f"TEXT-LIKE-CHARACTER SCAN (threshold = {PRINTABLE_RUN_THRESHOLD} bytes)")
-    w("  Character set checked: letters, digits, space, . , - / : '")
+    w("UNRECOGNIZED ANNOTATION-LIKE CHANNELS")
+    w(f"  Structural check: first {TAL_SAMPLE_N_RECORDS} records start with a valid "
+      f"TAL onset pattern in >= {TAL_SAMPLE_MATCH_FRACTION:.0%} of samples")
     w(SUBSEP)
-    if not pass_result.printable_findings:
-        w("  No suspicious text-like runs found.")
+    flagged_rows = []
+    for idx, tal_frac in sorted(pass_result.tal_sample_match.items()):
+        if idx in annot_indices:
+            continue  # already-recognized annotation channels, not the point of this check
+        if tal_frac >= TAL_SAMPLE_MATCH_FRACTION:
+            label = original_header.signals[idx].label
+            flagged_rows.append([str(idx), label, f"{tal_frac:.0%}"])
+    if not flagged_rows:
+        w("  No unrecognized channels structurally resemble an annotation channel.")
     else:
-        w(f"  {len(pass_result.printable_findings)} finding(s) -- REVIEW EACH BELOW:")
-        finding_rows = [
-            [str(f.record_index), f"{f.channel_index} ({f.channel_label})",
-             str(f.byte_offset), str(f.length), repr(f.preview)]
-            for f in pass_result.printable_findings
-        ]
-        for line in _fmt_dynamic_table(['record#', 'channel', 'offset', 'length', 'preview'], finding_rows):
+        w(f"  {len(flagged_rows)} channel(s) flagged -- REVIEW EACH BELOW:")
+        for line in _fmt_dynamic_table(['#', 'Label', 'TAL-sample match'], flagged_rows):
             w(line)
     w("")
 
     # ── 7. Overall ───────────────────────────────────────────────────────────
     w(SUBSEP)
-    overall_ok = hdr_ok and tal_ok and pass_result.hashes_match and not pass_result.printable_findings
+    overall_ok = hdr_ok and tal_ok and pass_result.hashes_match and not flagged_rows
     w(f"OVERALL: {'PASS' if overall_ok else 'NEEDS REVIEW'}")
     if not overall_ok:
         reasons = []
@@ -183,8 +186,8 @@ def build_report(
             reasons.append("annotation channel(s) did not reduce to clean time-keeping TAL")
         if not pass_result.hashes_match:
             reasons.append("integrity hash mismatch")
-        if pass_result.printable_findings:
-            reasons.append(f"{len(pass_result.printable_findings)} text-like-character finding(s) need human review")
+        if flagged_rows:
+            reasons.append(f"{len(flagged_rows)} unrecognized channel(s) structurally resemble an annotation channel")
         w("  Reason(s): " + "; ".join(reasons))
     w(SEP)
 
