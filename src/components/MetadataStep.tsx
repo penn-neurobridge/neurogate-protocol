@@ -185,8 +185,8 @@ export default function MetadataStep({
   const validationErrors = useMemo(() => {
     const errors: string[] = [];
 
-    if (!institutionConfig.prefix || !/^[A-Z]{2,6}$/.test(institutionConfig.prefix)) {
-      errors.push('Institution prefix must be 2-6 uppercase letters');
+    if (!institutionConfig.prefix || !/^[A-Z]{2,}$/.test(institutionConfig.prefix)) {
+      errors.push('Institution prefix must be 2 or more uppercase letters');
     }
 
     if (!datasetDescription.name.trim()) {
@@ -269,15 +269,15 @@ export default function MetadataStep({
                   value={institutionConfig.prefix}
                   onChange={(e) => setInstitutionConfig(prev => ({
                     ...prev,
-                    prefix: e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6),
+                    prefix: e.target.value.toUpperCase().replace(/[^A-Z]/g, ''),
                   }))}
                   placeholder="e.g., CHOP, PENN, HUP"
-                  maxLength={6}
+                  maxLength={20}
                   className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2
                     hover:border-gray-400 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none
                     uppercase tracking-wider"
                 />
-                <p className="text-xs text-gray-500 mt-1">2-6 uppercase letters identifying your institution</p>
+                <p className="text-xs text-gray-500 mt-1">2 or more uppercase letters identifying your institution</p>
               </div>
 
               <div className="w-40">
