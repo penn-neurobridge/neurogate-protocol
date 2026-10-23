@@ -21,6 +21,8 @@
 
 import type { Session, DetectionReason } from '../../types/detection';
 import type { ScannedFile } from '../../types/files';
+import { looksLikeTimepointFolder } from './customSessionDetector';
+import { isTracerToken } from './petVocabulary';
 
 export interface SubjectGroupResult {
   /** Assigned subject group name */
@@ -29,7 +31,21 @@ export interface SubjectGroupResult {
   session: Session | null;
   /** Reasons for the grouping */
   reasons: DetectionReason[];
+  /**
+   * Set when a session-level subfolder matched the bare "post-op"/"postop"
+   * pattern and nothing else resolved a session. See
+   * folderDetector.ts's FolderResult.ambiguousSessionCandidate for the
+   * full rationale -- same deferred-to-modality-evidence resolution,
+   * applied here for the folder-depth patterns this module checks.
+   */
+  ambiguousSessionCandidate: Session | null;
 }
+
+/**
+ * Bare "post-op"/"postop" -- ambiguous between post-implant and
+ * post-surgery. Mirrors AMBIGUOUS_POSTOP_PATTERN in folderDetector.ts.
+ */
+const AMBIGUOUS_POSTOP_PATTERN = /\b(post[-\s]?op|postop)\b/i;
 
 // ── Common subject ID patterns in filenames ───────────────────────
 const SUBJECT_ID_PATTERNS: RegExp[] = [
@@ -46,6 +62,45 @@ const SUBJECT_ID_PATTERNS: RegExp[] = [
 ];
 
 /**
+ * True for a bare 4-digit number that falls in a plausible calendar-year
+ * range (1900-2099). Scan filenames very commonly embed the study/
+ * acquisition year (e.g. "scan_2026_alpha.nii.gz"), and that year is far
+ * more likely to appear in a flat (no-folder) drop than a real subject ID
+ * is. Used to guard the last-resort generic \b(\d{3,4})\b pattern below,
+ * which otherwise happily grabs the year and silently merges two
+ * different patients' files into one fake subject group. Bug found and
+ * confirmed 2026-08-02 via adversarial testing: two unrelated flat files
+ * sharing only a study year ("scan_2026_alpha.nii.gz",
+ * "scan_2026_beta.nii.gz") were both grouped under subject "2026".
+ * 3-digit matches are unaffected since no calendar year is 3 digits.
+ */
+function looksLikeCalendarYear(value: string): boolean {
+  if (!/^\d{4}$/.test(value)) return false;
+  const year = Number(value);
+  return year >= 1900 && year <= 2099;
+}
+
+/**
+ * True if a filename stem looks like a DICOM UID -- a dotted sequence of
+ * numeric segments like "2.16.124.113543.6006.99.14956571". DICOM UIDs
+ * routinely contain 3-4 digit numbers (e.g. "124") that perfectly match
+ * the last-resort \b(\d{3,4})\b subject ID pattern and the
+ * [A-Z]{2,6}\d{2,4} institution prefix pattern, producing spurious
+ * subject groups from scanner-generated filenames. If the stem starts
+ * with four or more dot-separated numeric segments, we skip all subject
+ * ID extraction and return null rather than pulling a meaningless UID
+ * fragment. Found via adversarial testing 2026-08-16: a Flywheel download
+ * with DICOM UID filenames was being grouped under subject "124" (from the
+ * third segment of the UID).
+ */
+function looksLikeDicomUid(fileNameStem: string): boolean {
+  // Match at least four dot-separated numeric segments at the start, which
+  // is the minimum signature of a real DICOM UID. Short dotted decimals
+  // (e.g. "v1.2") won't match, avoiding false positives on version strings.
+  return /^\d+(\.\d+){3,}/.test(fileNameStem);
+}
+
+/**
  * Extract subject ID from a filename using common patterns.
  */
 function extractSubjectIdFromFilename(fileName: string): string | null {
@@ -55,13 +110,65 @@ function extractSubjectIdFromFilename(fileName: string): string | null {
 
   // Normalize underscores to spaces so \b word boundaries work correctly.
   // Without this, "_001_" won't match \b(\d{3,4})\b because _ is a word char.
-  const normalized = nameWithoutExt.replace(/_/g, ' ');
+  //
+  // Tracer names that look like IDs ("AV45", "MK6240", "PI2620") are
+  // blanked first: the institution-prefix pattern below would otherwise
+  // read "AV45_scan" as a subject called AV45 and merge every subject's
+  // amyloid PET into it. See isTracerToken in petVocabulary.ts.
+  const normalized = nameWithoutExt
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map(token => (isTracerToken(token) ? '' : token))
+    .join(' ');
 
-  for (const pattern of SUBJECT_ID_PATTERNS) {
-    const match = normalized.match(pattern);
-    if (match) {
-      return match[1];
+  // DICOM UID filenames (e.g. "2.16.124.113543.6006.99.MR") contain short
+  // numeric segments that spuriously match subject ID patterns. Bail out
+  // immediately rather than returning a meaningless UID fragment as a
+  // "subject ID" that silently merges or splits patient groups.
+  if (looksLikeDicomUid(nameWithoutExt)) return null;
+
+  // Flywheel/Scitran packages DICOM series into .dicom.zip archives named
+  // after the scan protocol, which includes scanner acquisition parameters
+  // like bandwidth ("BW2264"), echo time ("te122"), b-values ("b3000"), etc.
+  // These look like "ep2d_diff_sms3_b3000_te122_d64_duty68_BW2264_pF68" --
+  // 9 underscore-separated segments. A subject-ID-bearing filename would
+  // rarely have more than 5 (e.g. "sub-01_ses-preimplant_task-rest_bold").
+  // If the stem has 7 or more segments, skip all subject ID extraction.
+  // Confirmed via real-data testing 2026-08-16: BW2264 (a bandwidth value)
+  // was being picked up as a subject ID from Flywheel scan-parameter filenames.
+  const underscoreSegments = nameWithoutExt.split(/[_\s]+/);
+  if (underscoreSegments.length >= 7) return null;
+
+  for (let i = 0; i < SUBJECT_ID_PATTERNS.length; i++) {
+    const match = normalized.match(SUBJECT_ID_PATTERNS[i]);
+    if (!match) continue;
+
+    // The last pattern in the list is the generic "any bare 3-4 digit
+    // number" last resort. When it matches a 4-digit number that looks
+    // like a calendar year, skip it rather than risk merging unrelated
+    // patients -- a false "ungrouped" split is far safer than a silent
+    // false merge. Skipping this pattern's match still lets us try
+    // nothing further (it's already last), so we fall through to null.
+    const isLastResortGenericNumber = i === SUBJECT_ID_PATTERNS.length - 1;
+    if (isLastResortGenericNumber) {
+      if (looksLikeCalendarYear(match[1])) continue;
+
+      // Skip DWI b-values, echo times, gradient directions, and other scan
+      // parameter numbers. A bare 3-4 digit number following a known MRI
+      // acquisition parameter token (simple or compound) is a scan setting,
+      // not a subject ID. Examples caught:
+      //   "DTI 64 dir b 1300"         → "b" prefix     → skip 1300
+      //   "ep2d diff SliceAcc b5k 128" → "b5k" prefix  → skip 128
+      //   "CMRR 5k 128 SBRef"          → "5k" prefix   → skip 128 (bare SI suffix)
+      //   "ep2d diff te94 d 64"        → "te94" prefix → skip 64
+      if (match.index !== undefined && match.index > 0) {
+        const before = normalized.slice(0, match.index).trimEnd();
+        // Match simple (b, te, tr, bw) OR compound (b5k, b3k, te94, tr2000) prefixes.
+        if (/\b(b\d*[kmgM]?|\d+[kmgM]|te\d*|tr\d*|bw\d*|ti\d*|fa\d*|flip\d*|d\d+|duty\d+)$/i.test(before)) continue;
+      }
     }
+
+    return match[1];
   }
   return null;
 }
@@ -97,36 +204,40 @@ function getSecondLevelFolder(relativePath: string): string | null {
  * Given "StudyFolder/Patient_001/Session_preimplant/modality/file.nii.gz",
  * checks "Session_preimplant".
  */
-function getSessionFromThirdLevel(relativePath: string): { session: Session | null; folderName: string | null } {
+function getSessionFromThirdLevel(relativePath: string): { session: Session | null; folderName: string | null; ambiguousSessionCandidate: Session | null } {
   const parts = relativePath.split('/').filter(s => s.length > 0);
   if (parts.length < 4) {
-    return { session: null, folderName: null };
+    return { session: null, folderName: null, ambiguousSessionCandidate: null };
   }
 
   // Normalize underscores to spaces for word boundary matching
   const subfolder = parts[2].replace(/_/g, ' ').toLowerCase();
 
   if (/\b(pre[-\s]?implant|preimplant|pre[-\s]?op|preop|pre[-\s]?surg|baseline|phase[-\s]?1|session[-\s]?1|ses[-\s]?1)\b/i.test(subfolder)) {
-    return { session: 'ses-preimplant', folderName: parts[2] };
+    return { session: 'ses-preimplant', folderName: parts[2], ambiguousSessionCandidate: null };
   }
   if (/\b(post[-\s]?implant|postimplant|implant|monitoring|ictal|phase[-\s]?2|session[-\s]?2|ses[-\s]?2)\b/i.test(subfolder)) {
-    return { session: 'ses-postimplant', folderName: parts[2] };
+    return { session: 'ses-postimplant', folderName: parts[2], ambiguousSessionCandidate: null };
   }
-  if (/\b(post[-\s]?surg|postsurg|post[-\s]?op|postop|resection|post[-\s]?surgery|phase[-\s]?3|session[-\s]?3|ses[-\s]?3)\b/i.test(subfolder)) {
-    return { session: 'ses-postsurgery', folderName: parts[2] };
+  // Bare "post-op"/"postop" excluded here -- ambiguous, see AMBIGUOUS_POSTOP_PATTERN.
+  if (/\b(post[-\s]?surg|postsurg|resection|post[-\s]?surgery|phase[-\s]?3|session[-\s]?3|ses[-\s]?3)\b/i.test(subfolder)) {
+    return { session: 'ses-postsurgery', folderName: parts[2], ambiguousSessionCandidate: null };
+  }
+  if (AMBIGUOUS_POSTOP_PATTERN.test(subfolder)) {
+    return { session: null, folderName: parts[2], ambiguousSessionCandidate: 'ses-postsurgery' };
   }
 
-  return { session: null, folderName: null };
+  return { session: null, folderName: null, ambiguousSessionCandidate: null };
 }
 
 /**
  * Check if the second-level folder suggests a session.
  * Given "Patient01/PreOp/MRI/file.nii.gz", checks "PreOp".
  */
-function getSessionFromSubfolder(relativePath: string): { session: Session | null; folderName: string | null } {
+function getSessionFromSubfolder(relativePath: string): { session: Session | null; folderName: string | null; ambiguousSessionCandidate: Session | null } {
   const parts = relativePath.split('/').filter(s => s.length > 0);
   if (parts.length < 3) {
-    return { session: null, folderName: null };
+    return { session: null, folderName: null, ambiguousSessionCandidate: null };
   }
 
   // Normalize underscores to spaces so \b word boundaries work correctly
@@ -134,29 +245,85 @@ function getSessionFromSubfolder(relativePath: string): { session: Session | nul
 
   // Pre-implant patterns
   if (/\b(pre[-\s]?implant|preimplant|pre[-\s]?op|preop|pre[-\s]?surg|baseline|phase[-\s]?1|session[-\s]?1|ses[-\s]?1)\b/i.test(subfolder)) {
-    return { session: 'ses-preimplant', folderName: parts[1] };
+    return { session: 'ses-preimplant', folderName: parts[1], ambiguousSessionCandidate: null };
   }
 
   // Post-implant patterns
   if (/\b(post[-\s]?implant|postimplant|implant|monitoring|ictal|phase[-\s]?2|session[-\s]?2|ses[-\s]?2)\b/i.test(subfolder)) {
-    return { session: 'ses-postimplant', folderName: parts[1] };
+    return { session: 'ses-postimplant', folderName: parts[1], ambiguousSessionCandidate: null };
   }
 
-  // Post-surgery patterns
-  if (/\b(post[-\s]?surg|postsurg|post[-\s]?op|postop|resection|post[-\s]?surgery|phase[-\s]?3|session[-\s]?3|ses[-\s]?3)\b/i.test(subfolder)) {
-    return { session: 'ses-postsurgery', folderName: parts[1] };
+  // Post-surgery patterns. Bare "post-op"/"postop" excluded -- ambiguous,
+  // see AMBIGUOUS_POSTOP_PATTERN.
+  if (/\b(post[-\s]?surg|postsurg|resection|post[-\s]?surgery|phase[-\s]?3|session[-\s]?3|ses[-\s]?3)\b/i.test(subfolder)) {
+    return { session: 'ses-postsurgery', folderName: parts[1], ambiguousSessionCandidate: null };
+  }
+  if (AMBIGUOUS_POSTOP_PATTERN.test(subfolder)) {
+    return { session: null, folderName: parts[1], ambiguousSessionCandidate: 'ses-postsurgery' };
   }
 
-  return { session: null, folderName: null };
+  return { session: null, folderName: null, ambiguousSessionCandidate: null };
+}
+
+/**
+ * True if a folder name looks like a session/timepoint label rather than
+ * a patient identifier. Used to disambiguate the single-top-level-folder
+ * case in groupIntoSubject below: "PatientFolder/ses-X/modality/file"
+ * (one patient, several session subfolders) and
+ * "StudyFolder/Patient01/session/modality/file" wrapped one level
+ * shallower, i.e. "Patient01/session/modality/file" with no separate
+ * study-root wrapper, look identical in raw folder depth -- both have
+ * exactly one top-level folder and multiple distinct second-level
+ * folders. Only the subfolder NAMES tell them apart. Bug found and
+ * confirmed 2026-08-02: without this check, a single patient dropped
+ * alone with the standard session-subfolder structure was being split
+ * into one fake "subject" per session folder. Multi-patient drops (2+
+ * top-level folders) never hit this code path and were unaffected.
+ *
+ * @param customSessionIds When set (Custom timepoints datasets), matches
+ *   exactly against the dataset's own defined labels instead of the
+ *   implant fuzzy vocabulary, since custom labels have no fixed keyword
+ *   set to pattern-match against.
+ */
+function looksLikeSessionFolder(folderName: string, customSessionIds?: string[]): boolean {
+  const trimmed = folderName.trim();
+
+  // Timepoint conventions live in ONE place -- customSessionDetector's
+  // looksLikeTimepointFolder -- because this function and that module were
+  // answering the same question from two separate vocabularies, and they
+  // had drifted. This copy knew only "2weeks" and YYYYMMDD, so a dataset
+  // written as "week2", "W2", "2_weeks", "visit1", "V1" or
+  // "baseline"/"followup" had every visit folder treated as a separate
+  // PATIENT. That is the bug this whole function exists to prevent, and it
+  // was only ever fixed for one spelling of it (probe 2026-08-17).
+  if (looksLikeTimepointFolder(trimmed)) return true;
+
+  // Custom timepoints datasets additionally match their own exact defined
+  // labels, which have no fixed keyword vocabulary to infer from.
+  if (customSessionIds && customSessionIds.length > 0) {
+    if (customSessionIds.some(id => id.toLowerCase() === trimmed.toLowerCase())) return true;
+  }
+
+  // The Implant sessions preset's clinical vocabulary.
+  const normalized = trimmed.replace(/_/g, ' ').toLowerCase();
+  return /\b(pre[-\s]?implant|preimplant|pre[-\s]?op|preop|pre[-\s]?surg|baseline|post[-\s]?implant|postimplant|implant|monitoring|ictal|post[-\s]?surg|postsurg|post[-\s]?op|postop|resection|post[-\s]?surgery|phase[-\s]?[123]|session[-\s]?[123]|ses[-\s]?[123])\b/i.test(normalized)
+    || /^ses[-_]\w+$/i.test(trimmed);
 }
 
 /**
  * Group a single file into a subject cluster and try to infer
  * session from the folder structure.
+ *
+ * @param customSessionIds A Custom timepoints dataset's defined session
+ *   ids (e.g. ["ses-0mo", "ses-2mo"]), used only by
+ *   looksLikeSessionFolder's single-top-folder disambiguation above.
+ *   Omit for the Implant sessions preset, where the fuzzy vocabulary
+ *   already covers it.
  */
 export function groupIntoSubject(
   file: ScannedFile,
   allFiles: ScannedFile[],
+  customSessionIds?: string[],
 ): SubjectGroupResult {
   const reasons: DetectionReason[] = [];
   let groupName: string;
@@ -173,7 +340,15 @@ export function groupIntoSubject(
         .filter((f): f is string => f !== null)
     );
 
-    if (allTopFolders.size > 1) {
+    // If every top-level folder looks like a session label (Flywheel names like
+    // "2weeks"/"6months", YYYYMMDD dates, or named ses-* labels), do NOT treat
+    // them as different patients — they are sessions of one subject. Fall through
+    // to the second-level folder / filename extraction logic below.
+    const allTopLookLikeSessions =
+      allTopFolders.size > 0 &&
+      [...allTopFolders].every(f => looksLikeSessionFolder(f, customSessionIds));
+
+    if (allTopFolders.size > 1 && !allTopLookLikeSessions) {
       // Multiple top-level folders → each is likely a different patient
       groupName = topFolder;
       reasons.push({
@@ -193,7 +368,49 @@ export function groupIntoSubject(
         });
       }
 
-      return { groupName, session, reasons };
+      return { groupName, session, reasons, ambiguousSessionCandidate: subfolderSession.ambiguousSessionCandidate };
+    }
+
+    // When ALL top-level folders are session labels (Flywheel "2weeks"/"6months",
+    // YYYYMMDD dates, etc.), second-level folders are SCAN SERIES names, not
+    // patient identifiers. Skip second-level patient detection entirely and go
+    // straight to filename-based subject ID extraction.
+    // Requires MORE THAN ONE session-looking top folder. With exactly one,
+    // that folder is the dropped container itself, not a session --
+    // scanDirectory prefixes every relative path with basename(root), so a
+    // CLI run always has exactly one top-level folder. Without this
+    // condition the branch fired whenever the dropped folder's NAME merely
+    // resembled session vocabulary, and its premise ("second-level folders
+    // are scan series") was then false.
+    //
+    // Real failure: a cohort directory named "Phase2_MRI" matched the
+    // implant preset's "phase[-\s]?[123]" pattern, so all 19 patient
+    // folders beneath it were taken for scan series and every patient
+    // merged into one "ungrouped" subject -- 836 files under a single
+    // fabricated subject. Renaming the same tree to "TBI_Study" grouped it
+    // correctly, which is how the name-dependence was found (2026-08-17).
+    //
+    // Two or more session-looking top folders still take this path: that is
+    // a browser drop of a subject's session folders directly, where the
+    // premise does hold.
+    if (allTopLookLikeSessions && allTopFolders.size > 1) {
+      const subjectId = extractSubjectIdFromFilename(file.name);
+      if (subjectId) {
+        groupName = subjectId;
+        reasons.push({
+          layer: 'subject-grouping',
+          message: `Subject ID from filename: "${subjectId}" (top-level folders are sessions)`,
+          weight: 0.5,
+        });
+      } else {
+        groupName = 'ungrouped';
+        reasons.push({
+          layer: 'subject-grouping',
+          message: `Single subject: all top-level folders are session labels, no ID in filenames`,
+          weight: 0.3,
+        });
+      }
+      return { groupName, session, reasons, ambiguousSessionCandidate: null };
     }
 
     // Only one top-level folder (the dropped parent, e.g., "EpilepsyStudy_Raw").
@@ -204,7 +421,18 @@ export function groupIntoSubject(
         .filter((f): f is string => f !== null)
     );
 
-    if (secondLevelFolders.size > 1) {
+    // Multiple second-level folders alone is ambiguous: it's consistent
+    // both with "several patient folders under a shared study root" AND
+    // "one patient with several session subfolders." Only treat it as
+    // multiple patients when the second-level folder names DON'T all
+    // look like session labels -- if they do, fall through to the
+    // single-top-folder branch below, which correctly treats topFolder
+    // as the one patient and looks for a session at the second level.
+    const allSecondLevelLookLikeSessions =
+      secondLevelFolders.size > 0 &&
+      [...secondLevelFolders].every(f => looksLikeSessionFolder(f, customSessionIds));
+
+    if (secondLevelFolders.size > 1 && !allSecondLevelLookLikeSessions) {
       // Multiple second-level folders → likely patient folders under a study parent
       const secondFolder = getSecondLevelFolder(file.relativePath);
       if (secondFolder) {
@@ -226,7 +454,7 @@ export function groupIntoSubject(
           });
         }
 
-        return { groupName, session, reasons };
+        return { groupName, session, reasons, ambiguousSessionCandidate: thirdLevelSession.ambiguousSessionCandidate };
       }
     }
 
@@ -251,7 +479,7 @@ export function groupIntoSubject(
         });
       }
 
-      return { groupName, session, reasons };
+      return { groupName, session, reasons, ambiguousSessionCandidate: subfolderSession.ambiguousSessionCandidate };
     }
 
     // Fall through to using top folder even though there's only one
@@ -272,7 +500,7 @@ export function groupIntoSubject(
       });
     }
 
-    return { groupName, session, reasons };
+    return { groupName, session, reasons, ambiguousSessionCandidate: subfolderSession.ambiguousSessionCandidate };
   }
 
   // ── Strategy 2: No folder structure — try filename ──────────
@@ -284,16 +512,16 @@ export function groupIntoSubject(
       message: `Subject ID extracted from filename: "${subjectId}"`,
       weight: 0.4,
     });
-    return { groupName, session, reasons };
+    return { groupName, session, reasons, ambiguousSessionCandidate: null };
   }
 
   // ── Strategy 3: Can't determine — single group ─────────────
   groupName = 'ungrouped';
   reasons.push({
     layer: 'subject-grouping',
-    message: 'Could not determine subject grouping — manual assignment needed',
+    message: 'Could not determine subject grouping: manual assignment needed',
     weight: 0.1,
   });
 
-  return { groupName, session, reasons };
+  return { groupName, session, reasons, ambiguousSessionCandidate: null };
 }

@@ -4,23 +4,30 @@ import { downloadAuditJson, downloadAuditCsv } from '../lib/audit';
 import type { AuditEntry } from '../types/audit';
 
 const ACTION_LABELS: Record<string, string> = {
+  'structure-selected': 'Structure Selected',
+  'structure-changed': 'Structure Changed',
   'files-scanned': 'Files Scanned',
+  'session-restored': 'Progress Restored',
+  'audit-log-restored': 'Log Restored',
   'detection-completed': 'Detection Complete',
   'session-corrected': 'Session Corrected',
   'modality-corrected': 'Modality Corrected',
   'subject-corrected': 'Subject Corrected',
   'bulk-session-applied': 'Bulk Session',
   'bulk-modality-applied': 'Bulk Modality',
+  'task-corrected': 'Task Corrected',
+  'bulk-task-applied': 'Bulk Task',
   'institution-configured': 'Institution Config',
   'subject-metadata-entered': 'Subject Metadata',
   'dataset-description-entered': 'Dataset Description',
   'defacing-attested': 'Defacing Attested',
-  'defacing-revoked': 'Defacing Revoked',
+  'defacing-revoked': 'Defacing Attestation Removed',
   'validation-run': 'Validation Run',
   'validation-issue-dismissed': 'Issue Dismissed',
-  'upload-started': 'Upload Started',
-  'upload-completed': 'Upload Complete',
-  'upload-failed': 'Upload Failed',
+  'validation-dismissals-cleared': 'Dismissals Cleared',
+  'validation-passed': 'Validation Passed',
+  'export-completed': 'Export Complete',
+  'deidentification-summary': 'De-identification',
   'audit-log-exported': 'Log Exported',
 };
 
@@ -67,7 +74,7 @@ export default function AuditLogPanel({ isOpen, onClose }: AuditLogPanelProps) {
           </div>
           <button
             onClick={onClose}
-            className="text-blue-200 hover:text-white transition-colors text-lg"
+            className="btn-cta text-blue-200 hover:text-white transition-colors text-lg"
             aria-label="Close audit log panel"
           >
             &times;
@@ -79,7 +86,7 @@ export default function AuditLogPanel({ isOpen, onClose }: AuditLogPanelProps) {
           <button
             onClick={handleExportJson}
             disabled={entries.length === 0}
-            className="px-3 py-1.5 text-xs font-medium bg-[#011F5B] text-white rounded
+            className="btn-cta px-3 py-1.5 text-xs font-medium bg-[#011F5B] text-white rounded
               hover:bg-[#01326e] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Export JSON
@@ -87,14 +94,14 @@ export default function AuditLogPanel({ isOpen, onClose }: AuditLogPanelProps) {
           <button
             onClick={handleExportCsv}
             disabled={entries.length === 0}
-            className="px-3 py-1.5 text-xs font-medium bg-white text-gray-700 border border-gray-300 rounded
+            className="btn-cta px-3 py-1.5 text-xs font-medium bg-white text-gray-700 border border-gray-300 rounded
               hover:bg-gray-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Export CSV
           </button>
           <div className="flex-1" />
           <span className="text-xs text-gray-500 self-center">
-            ALCOA+ Compliant
+            ALCOA+ aligned
           </span>
         </div>
 

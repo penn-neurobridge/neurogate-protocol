@@ -1,0 +1,317 @@
+import { useState } from 'react';
+import Button from './Button';
+import {
+  SESSION_PRESETS,
+  TIMEPOINT_UNITS,
+  MAX_CUSTOM_TIMEPOINTS,
+  buildCustomSessionLabel,
+  sortTimepoints,
+  findDuplicateTimepoints,
+  validateCustomTimepoints,
+  toTimepointNumber,
+  MAX_TIMEPOINT_NUMBER,
+  type PresetId,
+  type CustomTimepoint,
+  type TimepointUnit,
+  type DatasetStructure,
+} from '../types/sessionStructure';
+
+/**
+ * Phase 1 addition (July 2026): the structure-setup screen shown before
+ * file organization begins. Wired in as Step 1 of 6 in ToolPage.tsx's
+ * /tool flow. See Documents/Phase1_Flexible_Folder_Structure_Spec.md.
+ *
+ * Phase 2 addition (August 2026): a Step 0 gate now runs ahead of the
+ * preset card grid -- "does each subject have more than one session?" --
+ * so the Single session preset never has to appear as a card the user
+ * has to read and rule out, and the card grid never grows past what's
+ * genuinely relevant once a fifth preset (e.g. Event-triggered
+ * timepoints) is added later. See
+ * Documents/Phase2_Additional_Dataset_Presets_Spec.md Section 5.
+ *
+ * Step 0: "does each subject have more than one session?" No/Yes.
+ *   No  -> Single session, no card grid, one-line confirmation.
+ *   Yes -> Step 1 below.
+ * Step 1 (Yes branch only): pick a preset from an extensible list,
+ * excluding Single session (that's reached only through Step 0's No).
+ * Step 2 (Custom timepoints only): build timepoints from a number + unit
+ * picker. There is no free-text entry anywhere in Step 2, so a site name
+ * or PI name cannot end up in a generated session label.
+ */
+
+interface StructureSetupStepProps {
+  onContinue: (structure: DatasetStructure) => void;
+  onBack?: () => void;
+  /** Pre-fill the picker from a previously chosen structure (e.g. on re-entry). */
+  initialStructure?: DatasetStructure;
+}
+
+function emptyTimepoint(): CustomTimepoint {
+  return { number: 0, unit: 'month' };
+}
+
+/** Step 0's answer. 'unanswered' shows the gate question itself. */
+type GateAnswer = 'unanswered' | 'no' | 'yes';
+
+function initialGateAnswer(initialStructure?: DatasetStructure): GateAnswer {
+  if (!initialStructure) return 'unanswered';
+  return initialStructure.presetId === 'single-session' ? 'no' : 'yes';
+}
+
+/** Presets offered in the Step 1 card grid. Single session is deliberately
+ * excluded here -- it's reached only via Step 0's "No" answer, never as a
+ * card, so the grid stays as small as possible as more presets are added. */
+const PICKER_PRESETS = SESSION_PRESETS.filter(p => p.id !== 'single-session');
+
+export default function StructureSetupStep({ onContinue, onBack, initialStructure }: StructureSetupStepProps) {
+  const [gate, setGate] = useState<GateAnswer>(initialGateAnswer(initialStructure));
+  const [selectedPreset, setSelectedPreset] = useState<PresetId | null>(
+    initialStructure && initialStructure.presetId !== 'single-session' ? initialStructure.presetId : null,
+  );
+  const [timepoints, setTimepoints] = useState<CustomTimepoint[]>(
+    initialStructure?.presetId === 'custom-timepoints' && initialStructure.timepoints.length > 0
+      ? initialStructure.timepoints
+      : [emptyTimepoint()],
+  );
+  const [showErrors, setShowErrors] = useState(false);
+
+  const validation = validateCustomTimepoints(timepoints);
+  const duplicateIndices = new Set(findDuplicateTimepoints(timepoints));
+  const sortedPreview = sortTimepoints(timepoints);
+
+  function updateTimepoint(index: number, patch: Partial<CustomTimepoint>) {
+    setTimepoints(prev => prev.map((tp, i) => (i === index ? { ...tp, ...patch } : tp)));
+  }
+
+  function addTimepoint() {
+    if (timepoints.length >= MAX_CUSTOM_TIMEPOINTS) return;
+    setTimepoints(prev => [...prev, emptyTimepoint()]);
+  }
+
+  function removeTimepoint(index: number) {
+    setTimepoints(prev => prev.filter((_, i) => i !== index));
+  }
+
+  function handleContinue() {
+    if (selectedPreset === 'implant') {
+      onContinue({ presetId: 'implant' });
+      return;
+    }
+    if (selectedPreset === 'custom-timepoints') {
+      if (!validation.valid) {
+        setShowErrors(true);
+        return;
+      }
+      onContinue({ presetId: 'custom-timepoints', timepoints });
+    }
+  }
+
+  // ── Step 0: the gate question itself ──────────────────────────────
+  if (gate === 'unanswered') {
+    return (
+      <div className="max-w-3xl mx-auto py-8">
+        <h2 className="text-lg font-semibold text-gray-900 mb-1">Study structure</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          Choose how this dataset's sessions are organized. You can change it later from the Drop Files or Mapping step; the files you've added are then cleared.
+        </p>
+
+        <p className="text-sm font-medium text-gray-800 mb-4">
+          Does each subject have more than one session of data?
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+          <button
+            type="button"
+            onClick={() => setGate('no')}
+            className="btn-cta text-left rounded-xl border border-gray-200 bg-white hover:border-gray-300 p-4 transition-colors"
+          >
+            <div className="text-sm font-semibold text-gray-900 mb-1">No</div>
+            <div className="text-xs text-gray-500 leading-relaxed">
+              One folder of data per subject: a cross-sectional study, or a single-block acute/implant recording with no follow-up timepoints.
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setGate('yes')}
+            className="btn-cta text-left rounded-xl border border-gray-200 bg-white hover:border-gray-300 p-4 transition-colors"
+          >
+            <div className="text-sm font-semibold text-gray-900 mb-1">Yes</div>
+            <div className="text-xs text-gray-500 leading-relaxed">
+              Multiple sessions per subject: an implant workup, a longitudinal study with defined timepoints, or another multi-session structure.
+            </div>
+          </button>
+        </div>
+
+        <div className="flex justify-between">
+          {onBack ? (
+            <Button variant="secondary" onClick={onBack}>Back</Button>
+          ) : <div />}
+          <div />
+        </div>
+      </div>
+    );
+  }
+
+  // ── Step 0 answered "No": Single session, no card grid needed ──────
+  if (gate === 'no') {
+    return (
+      <div className="max-w-3xl mx-auto py-8">
+        <h2 className="text-lg font-semibold text-gray-900 mb-1">Study structure</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          Choose how this dataset's sessions are organized. You can change it later from the Drop Files or Mapping step; the files you've added are then cleared.
+        </p>
+
+        <div className="rounded-xl border border-gray-200 bg-white p-4 mb-8">
+          <div className="text-sm font-semibold text-gray-900 mb-1">Single session</div>
+          <div className="text-xs text-gray-500 leading-relaxed">
+            Files will be organized as one folder per subject, no session folders.
+          </div>
+        </div>
+
+        <div className="flex justify-between">
+          <Button variant="secondary" onClick={() => setGate('unanswered')}>Back</Button>
+          <Button variant="primary" onClick={() => onContinue({ presetId: 'single-session' })}>
+            Continue
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Step 0 answered "Yes": existing Step 1 (+ Step 2) flow ─────────
+  return (
+    <div className="max-w-3xl mx-auto py-8">
+      <h2 className="text-lg font-semibold text-gray-900 mb-1">Study structure</h2>
+      <p className="text-sm text-gray-500 mb-6">
+        Choose how this dataset's sessions are organized. You can change it later from the Drop Files or Mapping step; the files you've added are then cleared.
+      </p>
+
+      {/* ── Step 1: preset picker ─────────────────────────────── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+        {PICKER_PRESETS.map(preset => {
+          const isSelected = selectedPreset === preset.id;
+          return (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => setSelectedPreset(preset.id)}
+              className={`btn-cta text-left rounded-xl border p-4 transition-colors ${
+                isSelected
+                  ? 'border-blue-600 bg-blue-50'
+                  : 'border-gray-200 bg-white hover:border-gray-300'
+              }`}
+            >
+              <div className="text-sm font-semibold text-gray-900 mb-1">{preset.label}</div>
+              <div className="text-xs text-gray-500 leading-relaxed">{preset.description}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Step 2: custom timepoints builder ─────────────────── */}
+      {selectedPreset === 'custom-timepoints' && (
+        <div className="rounded-xl border border-gray-200 bg-white p-4 mb-6">
+          <div className="text-sm font-semibold text-gray-900 mb-3">Define timepoints</div>
+
+          <div className="flex flex-col gap-2 mb-3">
+            {timepoints.map((tp, i) => {
+              const isDuplicate = duplicateIndices.has(i);
+              return (
+                <div key={i} className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={0}
+                    max={MAX_TIMEPOINT_NUMBER}
+                    step={1}
+                    value={tp.number}
+                    onChange={e => updateTimepoint(i, { number: toTimepointNumber(Number(e.target.value)) })}
+                    className="w-16 text-sm border border-gray-300 rounded px-2 py-1.5"
+                    aria-label={`Timepoint ${i + 1} number`}
+                  />
+                  <select
+                    value={tp.unit}
+                    onChange={e => updateTimepoint(i, { unit: e.target.value as TimepointUnit })}
+                    className="text-sm border border-gray-300 rounded px-2 py-1.5 bg-white"
+                    aria-label={`Timepoint ${i + 1} unit`}
+                  >
+                    {TIMEPOINT_UNITS.map(u => (
+                      <option key={u.value} value={u.value}>{u.label}</option>
+                    ))}
+                  </select>
+                  <span className="text-sm text-gray-400">&rarr;</span>
+                  <code
+                    className={`text-sm px-2 py-1 rounded ${
+                      isDuplicate ? 'bg-red-50 text-red-700' : 'bg-gray-100 text-gray-700'
+                    }`}
+                  >
+                    {buildCustomSessionLabel(tp)}
+                  </code>
+                  {tp.number === 0 && (
+                    <span className="text-xs text-gray-400">baseline</span>
+                  )}
+                  {isDuplicate && (
+                    <span className="text-xs text-red-600">duplicate label</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeTimepoint(i)}
+                    disabled={timepoints.length <= 1}
+                    className="ml-auto text-xs text-gray-400 hover:text-red-600 disabled:opacity-30 disabled:cursor-not-allowed"
+                    aria-label={`Remove timepoint ${i + 1}`}
+                  >
+                    Remove
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <button
+            type="button"
+            onClick={addTimepoint}
+            disabled={timepoints.length >= MAX_CUSTOM_TIMEPOINTS}
+            className="text-sm text-blue-600 hover:text-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            + Add timepoint
+          </button>
+
+          <p className="text-xs text-gray-400 mt-2">
+            Duplicate labels are blocked. Sessions are ordered by elapsed time, not entry order, regardless of the order you add them in.
+          </p>
+
+          {/* Chronological preview */}
+          {sortedPreview.length > 1 && (
+            <div className="mt-3 pt-3 border-t border-gray-100">
+              <div className="text-xs text-gray-400 mb-1">Session order:</div>
+              <div className="flex flex-wrap gap-1.5">
+                {sortedPreview.map((tp, i) => (
+                  <code key={i} className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded">
+                    {buildCustomSessionLabel(tp)}
+                  </code>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {showErrors && !validation.valid && (
+            <div className="mt-3 text-xs text-red-600">
+              {validation.errors.map((err, i) => (
+                <div key={i}>{err}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="flex justify-between">
+        <Button variant="secondary" onClick={() => setGate('unanswered')}>Back</Button>
+        <Button
+          variant="primary"
+          onClick={handleContinue}
+          disabled={!selectedPreset}
+        >
+          Continue
+        </Button>
+      </div>
+    </div>
+  );
+}

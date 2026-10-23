@@ -29,8 +29,11 @@ export interface NeighborResult {
 
 /**
  * Get the folder path of a file (everything before the last /).
+ * Exported so other custom-timepoints-only layers (e.g.
+ * customSessionNeighborPropagation.ts) can group files by folder the same
+ * way this file's own rules do, without duplicating the logic.
  */
-function getFolderPath(relativePath: string): string {
+export function getFolderPath(relativePath: string): string {
   const lastSlash = relativePath.lastIndexOf('/');
   return lastSlash === -1 ? '' : relativePath.substring(0, lastSlash);
 }
@@ -48,7 +51,6 @@ function getBasename(fileName: string): string {
 /**
  * Group files by their parent folder.
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function groupByFolder(files: ScannedFile[]): Map<string, ScannedFile[]> {
   const groups = new Map<string, ScannedFile[]>();
   for (const file of files) {
@@ -82,7 +84,7 @@ export function inferFromNeighbors(
   const neighbors = allFiles.filter(f => getFolderPath(f.relativePath) === folder && f !== file);
   const neighborNames = neighbors.map(n => n.name.toLowerCase());
   const neighborModalities = neighbors
-    .map(n => knownModalities.get(n.name))
+    .map(n => knownModalities.get(n.relativePath))
     .filter((m): m is Modality => m !== undefined);
 
   // ── Rule: JSON sidecar inherits modality from matching file ──
@@ -92,13 +94,14 @@ export function inferFromNeighbors(
       return nBasename === basename && !n.name.toLowerCase().endsWith('.json');
     });
     if (matchingFile) {
-      const matchedModality = knownModalities.get(matchingFile.name);
+      const matchedModality = knownModalities.get(matchingFile.relativePath);
       if (matchedModality) {
         modality = matchedModality;
         reasons.push({
           layer: 'neighbor',
-          message: `JSON sidecar matches "${matchingFile.name}" — inheriting modality`,
+          message: `JSON sidecar matches "${matchingFile.name}": inheriting modality`,
           weight: 0.7,
+          supports: 'modality',
         });
       }
     }
@@ -112,8 +115,9 @@ export function inferFromNeighbors(
       modality = 'dwi';
       reasons.push({
         layer: 'neighbor',
-        message: `Found ${hasBval ? '.bval' : ''}${hasBval && hasBvec ? ' and ' : ''}${hasBvec ? '.bvec' : ''} in same folder — this is a diffusion MRI`,
+        message: `Found ${hasBval ? '.bval' : ''}${hasBval && hasBvec ? ' and ' : ''}${hasBvec ? '.bvec' : ''} in same folder: this is a diffusion MRI`,
         weight: 0.8,
+        supports: 'modality',
       });
     }
   }
@@ -126,8 +130,9 @@ export function inferFromNeighbors(
       modality = 'ieeg';
       reasons.push({
         layer: 'neighbor',
-        message: 'EDF/BDF file in folder with electrode/channel metadata — likely intracranial EEG',
+        message: 'EDF/BDF file in folder with electrode/channel metadata: likely intracranial EEG',
         weight: 0.6,
+        supports: 'modality',
       });
     }
   }
@@ -135,7 +140,7 @@ export function inferFromNeighbors(
   // ── Rule: CT + iEEG in same subject group → ses-postimplant ──
   // This is the only session that has both CT and intracranial EEG.
   const hasCT = neighborModalities.includes('ct') ||
-    (knownModalities.get(file.name) === 'ct');
+    (knownModalities.get(file.relativePath) === 'ct');
   const hasIEEG = neighborModalities.includes('ieeg') ||
     neighborNames.some(n => n.endsWith('.nwb') || n.endsWith('.dat') || n.endsWith('.lay'));
 
@@ -145,22 +150,23 @@ export function inferFromNeighbors(
     ? allFiles.filter(f => getFolderPath(f.relativePath).startsWith(parentFolder))
     : [];
   const siblingModalities = siblingFiles
-    .map(f => knownModalities.get(f.name))
+    .map(f => knownModalities.get(f.relativePath))
     .filter((m): m is Modality => m !== undefined);
 
   const ctInGroup = hasCT || siblingModalities.includes('ct');
   const ieegInGroup = hasIEEG || siblingModalities.includes('ieeg');
 
   if (ctInGroup && ieegInGroup) {
-    const currentModality = knownModalities.get(file.name);
+    const currentModality = knownModalities.get(file.relativePath);
     if (currentModality === 'ct' || currentModality === 'ieeg' ||
         fileName.endsWith('.dat') || fileName.endsWith('.lay') ||
         fileName.endsWith('.nwb')) {
       session = 'ses-postimplant';
       reasons.push({
         layer: 'neighbor',
-        message: 'CT and iEEG found in same subject group — this is the post-implant session',
+        message: 'CT and iEEG found in same subject group: this is the post-implant session',
         weight: 0.7,
+        supports: 'session',
       });
     }
   }
@@ -175,7 +181,7 @@ export function inferFromNeighbors(
       // Also check with just any .lay in the folder
       const anyLay = neighborNames.some(n => n.endsWith('.lay'));
       if (!anyLay) {
-        warnings.push(`Persyst .dat file "${file.name}" has no matching .lay file — both are required`);
+        warnings.push(`Persyst .dat file "${file.name}" has no matching .lay file: both are required`);
       }
     }
   }
@@ -189,21 +195,22 @@ export function inferFromNeighbors(
     if (!hasDat) {
       const anyDat = neighborNames.some(n => n.endsWith('.dat'));
       if (!anyDat) {
-        warnings.push(`Persyst .lay file "${file.name}" has no matching .dat file — both are required`);
+        warnings.push(`Persyst .lay file "${file.name}" has no matching .dat file: both are required`);
       }
     }
   }
 
   // ── Rule: Standalone T1w with no iEEG/CT neighbors → preimplant ──
   if (!session) {
-    const currentModality = modality || knownModalities.get(file.name);
+    const currentModality = modality || knownModalities.get(file.relativePath);
     if (currentModality === 'anat-T1w' || currentModality === 'anat-T2w' || currentModality === 'anat-FLAIR') {
       if (!ieegInGroup && !ctInGroup) {
         session = 'ses-preimplant';
         reasons.push({
           layer: 'neighbor',
-          message: 'Anatomical MRI with no CT or iEEG in subject group — likely pre-implant baseline',
+          message: 'Anatomical MRI with no CT or iEEG in subject group: likely pre-implant baseline',
           weight: 0.3,
+          supports: 'session',
         });
       }
     }

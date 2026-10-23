@@ -6,6 +6,9 @@
  *   2. PHI scanning
  *   3. Required files check
  *   4. Cross-session consistency
+ *   5. PET sidecar completeness (warnings)
+ *   5b. Consistency: channels vs electrodes, Persyst pairs, sessions.tsv
+ *   6. Metadata, sparse and empty-dataset checks
  *
  * Produces a ValidationReport with all issues, counts, and pass/fail.
  */
@@ -14,12 +17,15 @@ import type { DetectionResult } from '../../types/detection';
 import type { SubjectMetadata, DatasetDescription, DefacingAttestation, InstitutionConfig } from '../../types/metadata';
 import type { ValidationIssue, ValidationReport } from '../../types/validation';
 import { finalizeReport } from '../../types/validation';
-import { getEffectiveModality } from '../../types/detection';
+import { getEffectiveModality, requiresDefacing, DEFACING_MODALITY_LABELS } from '../../types/detection';
+import type { DatasetStructure } from '../../types/sessionStructure';
 
 import { validateBidsStructure } from './bidsValidator';
-import { scanForPhi } from './phiScanner';
+import { scanForPhi, scanSidecarContentForPhi, scanTsvContentForPhi, scanNiftiHeadersForPhi } from './phiScanner';
 import { checkRequiredFiles } from './requiredFilesChecker';
 import { checkCrossSessionConsistency } from './crossSessionChecker';
+import { checkPetSidecars } from './petChecker';
+import { checkConsistency } from './consistencyChecker';
 
 /** Everything the validation engine needs as input */
 export interface ValidationInput {
@@ -28,6 +34,14 @@ export interface ValidationInput {
   datasetDescription: DatasetDescription;
   defacingAttestation: DefacingAttestation;
   institutionConfig: InstitutionConfig;
+  /**
+   * The dataset's chosen session structure. Optional so existing callers
+   * that don't pass it see identical behavior to before Phase 2 -- passed
+   * through to checkRequiredFiles/checkCrossSessionConsistency, which use
+   * it only to recognize the Single session preset's expected null
+   * sessions instead of treating every one as a detection failure.
+   */
+  structure?: DatasetStructure;
 }
 
 /**
@@ -35,28 +49,59 @@ export interface ValidationInput {
  *
  * Returns a ValidationReport with all issues found across all validators.
  */
-export function runValidation(input: ValidationInput): ValidationReport {
+export async function runValidation(input: ValidationInput): Promise<ValidationReport> {
   const allIssues: ValidationIssue[] = [];
 
   // ── 1. BIDS Structure ─────────────────────────────────────
-  const bidsIssues = validateBidsStructure(input.detectionResults, input.subjects);
+  const bidsIssues = validateBidsStructure(input.detectionResults, input.subjects, input.structure);
   allIssues.push(...bidsIssues);
 
   // ── 2. PHI Scanning ───────────────────────────────────────
   const phiIssues = scanForPhi(input.detectionResults, input.subjects);
   allIssues.push(...phiIssues);
 
+  // ── 2b. PHI scanning of sidecar JSON free-text content ─────
+  // (async: reads sidecar file contents, catches PHI in fields the
+  // automatic de-identifier deliberately leaves alone, e.g. SeriesDescription)
+  const sidecarPhiIssues = await scanSidecarContentForPhi(input.detectionResults);
+  allIssues.push(...sidecarPhiIssues);
+
+  // ── 2c. PHI scanning of exported TSV tables (cell contents) ──
+  allIssues.push(...await scanTsvContentForPhi(input.detectionResults));
+
+  // ── 2d. PHI scanning of NIfTI header text (descrip, aux_file) ──
+  allIssues.push(...scanNiftiHeadersForPhi(input.detectionResults));
+
   // ── 3. Required Files ─────────────────────────────────────
-  const requiredIssues = checkRequiredFiles(input.detectionResults, input.subjects);
+  const requiredIssues = checkRequiredFiles(input.detectionResults, input.subjects, input.structure);
   allIssues.push(...requiredIssues);
 
   // ── 4. Cross-Session Consistency ──────────────────────────
-  const crossIssues = checkCrossSessionConsistency(input.detectionResults, input.subjects);
+  const crossIssues = checkCrossSessionConsistency(input.detectionResults, input.subjects, input.structure);
   allIssues.push(...crossIssues);
+
+  // ── 4b. PET sidecar completeness (warnings only) ──────────
+  allIssues.push(...checkPetSidecars(input.detectionResults));
+
+  // ── 4c. Files that must agree with each other ─────────────
+  allIssues.push(...await checkConsistency(input.detectionResults, input.structure));
 
   // ── 5. Metadata completeness checks ───────────────────────
   const metadataIssues = validateMetadata(input);
   allIssues.push(...metadataIssues);
+
+  // ── 6. Sparse / single-file dataset warning ────────────────
+  const sparseIssues = checkSparseDataset(input);
+  allIssues.push(...sparseIssues);
+
+  // ── 7. Empty dataset (zero files at all) ───────────────────
+  // Every other check above operates per-subject/per-file, so a totally
+  // empty upload (e.g. the file picker silently failed, or the user
+  // cleared their selection) produces zero issues from any of them and
+  // reports a clean "passed" with nothing to show for it. Found via
+  // adversarial validation testing 2026-08-02.
+  const emptyIssues = checkEmptyDataset(input);
+  allIssues.push(...emptyIssues);
 
   // ── Finalize report ───────────────────────────────────────
   return finalizeReport(allIssues);
@@ -112,10 +157,7 @@ function validateMetadata(input: ValidationInput): ValidationIssue[] {
   }
 
   // Defacing attestation (only if structural MRI present)
-  const hasStructuralMri = input.detectionResults.some(r => {
-    const mod = getEffectiveModality(r);
-    return mod === 'anat-T1w' || mod === 'anat-T2w' || mod === 'anat-FLAIR';
-  });
+  const hasStructuralMri = input.detectionResults.some(requiresDefacing);
 
   if (hasStructuralMri) {
     if (!input.defacingAttestation.confirmed) {
@@ -124,16 +166,109 @@ function validateMetadata(input: ValidationInput): ValidationIssue[] {
         category: 'defacing',
         severity: 'error',
         title: 'Defacing attestation not confirmed',
-        description: 'Your upload includes structural MRI files (T1w/T2w) which must be defaced per HIPAA requirements. Go back to the Metadata step and confirm that all structural MRIs have been defaced.',
+        description: `This dataset includes structural MRI (${DEFACING_MODALITY_LABELS}), which GOV-001 requires to be defaced before sharing. Go back to the Metadata step and confirm that all structural MRIs have been defaced.`,
         affectedFiles: input.detectionResults
-          .filter(r => {
-            const mod = getEffectiveModality(r);
-            return mod === 'anat-T1w' || mod === 'anat-T2w' || mod === 'anat-FLAIR';
-          })
+          .filter(requiresDefacing)
           .map(r => r.relativePath),
         dismissable: false,
       });
     }
+  }
+
+  return issues;
+}
+
+// ── Sparse dataset check ──────────────────────────────────────────
+
+let sparseCounter = 0;
+function nextSparseId(): string {
+  return `sparse-${++sparseCounter}`;
+}
+
+/**
+ * Warn when the dataset appears to be a single-file or very sparse upload.
+ *
+ * A full multi-modal BIDS dataset typically has 10+ files per subject
+ * (e.g. T1w, CT, iEEG recording, electrodes.tsv, channels.tsv, sidecars).
+ * If the entire upload contains only 1-3 data files, it almost certainly
+ * represents an intentional single-file workflow (e.g. de-identifying one
+ * iEEG recording before export), and the user should be reminded that the
+ * rest of the session data is absent.
+ *
+ * The threshold is per-subject: if ANY subject has fewer than 4 data files
+ * across all sessions, surface the warning. Sidecar-only files are not
+ * counted as data files.
+ */
+function checkSparseDataset(input: ValidationInput): ValidationIssue[] {
+  sparseCounter = 0;
+  const issues: ValidationIssue[] = [];
+
+  const DATA_MODALITIES = new Set([
+    'anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-PDw', 'anat-T2starw', 'anat-angio',
+    'ct', 'pet', 'dwi', 'perf', 'func', 'fmap',
+    'ieeg', 'eeg',
+    'electrodes', 'channels', 'events',
+  ]);
+
+  // Group data files by subject
+  const subjectFileCounts = new Map<string, number>();
+  for (const result of input.detectionResults) {
+    const mod = getEffectiveModality(result);
+    if (!DATA_MODALITIES.has(mod)) continue;
+    const group = result.userSubjectGroup ?? result.subjectGroup;
+    subjectFileCounts.set(group, (subjectFileCounts.get(group) ?? 0) + 1);
+  }
+
+  for (const [group, count] of subjectFileCounts) {
+    if (count < 4) {
+      const fileNames = input.detectionResults
+        .filter(r => (r.userSubjectGroup ?? r.subjectGroup) === group)
+        .map(r => r.relativePath);
+
+      issues.push({
+        id: nextSparseId(),
+        category: 'required-files',
+        severity: 'warning',
+        title: 'Sparse dataset: only a few files added',
+        description: `Subject "${group}" has only ${count} data file${count === 1 ? '' : 's'}. A complete multi-modal dataset typically includes several imaging and/or recording files plus companion metadata files. If you intentionally added a single file (e.g. to de-identify one recording), you can ignore this warning. Otherwise, verify that you selected the correct folder and that no files were accidentally left out.`,
+        affectedFiles: fileNames,
+        subjectGroup: group,
+        dismissable: true,
+      });
+    }
+  }
+
+  return issues;
+}
+
+// ── Empty dataset check ────────────────────────────────────────────
+
+let emptyCounter = 0;
+function nextEmptyId(): string {
+  return `empty-${++emptyCounter}`;
+}
+
+/**
+ * Flag a totally empty upload. Every other validator in this pipeline is
+ * per-subject or per-file, so zero files means zero issues from any of
+ * them -- an accidentally-empty upload (failed file picker, cleared
+ * selection, wrong folder) would otherwise report a clean "passed" with
+ * nothing wrong, which is misleading: there's nothing to export.
+ */
+function checkEmptyDataset(input: ValidationInput): ValidationIssue[] {
+  emptyCounter = 0;
+  const issues: ValidationIssue[] = [];
+
+  if (input.detectionResults.length === 0) {
+    issues.push({
+      id: nextEmptyId(),
+      category: 'required-files',
+      severity: 'error',
+      title: 'No files added',
+      description: 'This dataset has no files at all. Go back to the file drop step and verify your folder selection; there is nothing here to export.',
+      affectedFiles: [],
+      dismissable: false,
+    });
   }
 
   return issues;

@@ -16,9 +16,12 @@
  * It cannot guarantee detection of all PHI, but catches common patterns.
  */
 
+import { readTableRows } from '../bids/delimitedText';
 import type { DetectionResult } from '../../types/detection';
 import type { SubjectMetadata } from '../../types/metadata';
 import type { ValidationIssue } from '../../types/validation';
+import { isJsonSidecarFile, BLANK_STRING_FIELDS, DATE_FIELDS } from '../deidentify/jsonSidecarDeidentifier';
+import { isExportedPath } from '../bids/bidsNaming';
 
 // ── PHI Detection Patterns ──────────────────────────────────────
 
@@ -56,7 +59,7 @@ const PHI_PATTERNS: PhiPattern[] = [
     name: 'Phone Number',
     pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/,
     severity: 'warning',
-    description: 'This looks like it might contain a phone number. Phone numbers are PHI — verify this is not patient data.',
+    description: 'This looks like it might contain a phone number. Phone numbers are PHI, so verify this is not patient data.',
   },
   // Email addresses
   {
@@ -67,22 +70,22 @@ const PHI_PATTERNS: PhiPattern[] = [
   },
   // Full dates that might be DOB (MM/DD/YYYY or MM-DD-YYYY)
   {
-    name: 'Potential date (PHI risk)',
-    pattern: /\b(?:0[1-9]|1[0-2])[\/\-](?:0[1-9]|[12]\d|3[01])[\/\-](?:19|20)\d{2}\b/,
+    name: 'date (PHI risk)',
+    pattern: /\b(?:0[1-9]|1[0-2])[/-](?:0[1-9]|[12]\d|3[01])[/-](?:19|20)\d{2}\b/,
     severity: 'warning',
     description: 'This contains a date in MM/DD/YYYY format. If this is a patient date of birth or admission date, it constitutes PHI.',
   },
   // Common name patterns in filenames (FirstLast, First_Last, etc.)
   // Only flag if it looks like a person's name alongside medical terms
   {
-    name: 'Potential patient name',
+    name: 'patient name',
     pattern: /\b(?:patient|pt|subj|subject)[_\-\s]?[A-Z][a-z]+[_\-\s]?[A-Z][a-z]+\b/,
     severity: 'error',
     description: 'This appears to contain a patient name. Patient names are PHI and must be replaced with de-identified subject IDs.',
   },
   // Last name, First name pattern
   {
-    name: 'Potential name (Last, First)',
+    name: 'name (Last, First)',
     pattern: /[A-Z][a-z]+,\s?[A-Z][a-z]+/,
     severity: 'warning',
     description: 'This matches a "Last, First" name pattern. If this is a patient name, it must be removed.',
@@ -100,6 +103,25 @@ const PHI_KEYWORDS = [
   'insurance', 'policy_number',
   'accession', 'acc_num',
 ];
+
+/**
+ * Normalize underscores to hyphens before testing PHI_PATTERNS regexes.
+ * Nearly every pattern in PHI_PATTERNS relies on \b word-boundary anchors,
+ * but JavaScript's \b treats underscore as a word character -- so a match
+ * sitting immediately next to an underscore (extremely common in real
+ * filenames, e.g. "123-45-6789_notes.nii.gz") silently fails to trigger
+ * the boundary and the whole match is missed. Hyphen is already a
+ * non-word character, so swapping preserves matchability without
+ * otherwise changing what the patterns can match. Mirrors the identical
+ * fix already used in filenameDetector.ts's normalizeForKeywords for the
+ * same underlying JS regex quirk. Only used for the regex test itself --
+ * all reporting still uses the original, unmodified path/filename/value.
+ * Found via adversarial validation testing 2026-08-02: an SSN-pattern
+ * filename immediately followed by "_" completely evaded detection.
+ */
+function normalizeForPhiMatching(text: string): string {
+  return text.replace(/_/g, '-');
+}
 
 let issueCounter = 0;
 function nextId(): string {
@@ -127,8 +149,9 @@ export function scanForPhi(
 
   // ── Run regex patterns against all paths ──────────────────
   for (const path of pathsToScan) {
+    const normalizedPath = normalizeForPhiMatching(path);
     for (const phiPattern of PHI_PATTERNS) {
-      if (phiPattern.pattern.test(path)) {
+      if (phiPattern.pattern.test(normalizedPath)) {
         // Find which files are affected
         const affected = results
           .filter(r => r.relativePath.includes(path) || r.fileName === path || r.subjectGroup === path)
@@ -192,7 +215,7 @@ export function scanForPhi(
         category: 'phi-risk',
         severity: 'error',
         title: 'Subject group name looks like a person\'s name',
-        description: `The subject group "${group}" appears to be a person's name (two capitalized words). If this is a patient's real name, it must be replaced with a de-identified subject ID before upload. The BIDS renaming will replace this with the assigned subject ID, but the original folder name may still be visible in audit logs.`,
+        description: `The subject group "${group}" appears to be a person's name (two capitalized words). If this is a patient's real name, it must be replaced with a de-identified subject ID before sharing. The BIDS renaming will replace this with the assigned subject ID, but the original folder name is still recorded in the audit log, which must stay at your site.`,
         affectedFiles: results.filter(r => r.subjectGroup === group).map(r => r.relativePath),
         subjectGroup: group,
         dismissable: false,
@@ -200,5 +223,283 @@ export function scanForPhi(
     }
   }
 
+  return issues;
+}
+
+// ── Sidecar JSON content scanning ───────────────────────────────
+//
+// deidentifyJsonSidecar() (see jsonSidecarDeidentifier.ts) blanks a fixed
+// list of known-identifying fields and shifts known date fields, but it
+// deliberately leaves free-text descriptive fields (SeriesDescription,
+// ProtocolName, ImageComments, etc.) untouched -- those are needed for
+// BIDS documentation and can't be blanked outright. If a scanner operator
+// typed a patient name or MRN into one of those free-text fields, nothing
+// in the automatic de-identification pipeline would catch it.
+//
+// This scans every string value in every sidecar JSON (skipping the
+// fields the de-identifier already handles) against the same PHI_PATTERNS
+// and PHI_KEYWORDS used for filenames. Reading sidecar files is async
+// (File.text()), so this is a separate async entry point rather than
+// folded into the synchronous scanForPhi() above.
+
+const FIELDS_HANDLED_BY_DEIDENTIFIER = new Set<string>([
+  ...BLANK_STRING_FIELDS,
+  ...DATE_FIELDS,
+]);
+
+// ── Bare-name heuristic for sidecar free text ───────────────────
+//
+// PHI_PATTERNS' name checks ("patient_John_Smith", "Smith, John") require
+// a keyword or comma trigger, because that's how names show up in
+// filenames. Sidecar free text is prose ("John Smith Brain MRI"), so a
+// name can appear as a plain two-word Title Case phrase with no trigger
+// at all. This checks for that pattern directly, but only in sidecar
+// content -- doing this on filenames/paths would be far too noisy.
+//
+// False-positive risk: legitimate scan descriptions are also frequently
+// Title Case ("Axial Flair", "Post Contrast"). SCAN_VOCAB is a stoplist
+// of common radiology/imaging terms; a two-word match is only flagged if
+// NEITHER word is in the stoplist. This is a heuristic, not a guarantee --
+// uncommon scan vocabulary not in this list can still produce a false
+// positive, and an uncommon real name can still slip through if either
+// word happens to collide with the stoplist. Flagged as a dismissable
+// warning (not an error) for that reason -- a human reviews it either way.
+
+const SCAN_VOCAB = new Set([
+  'axial', 'sagittal', 'coronal', 'oblique', 'volumetric', 'isotropic',
+  'flair', 'weighted', 'contrast', 'enhanced', 'post', 'pre', 'gad',
+  'fat', 'water', 'sat', 'saturation', 'suppression', 'diffusion',
+  'perfusion', 'spin', 'echo', 'gradient', 'fast', 'spoiled', 'recalled',
+  'interpolated', 'brain', 'spine', 'cervical', 'thoracic', 'lumbar',
+  'head', 'neck', 'chest', 'abdomen', 'pelvis', 'whole', 'body',
+  'research', 'study', 'clinical', 'protocol', 'standard', 'high',
+  'resolution', 'thin', 'thick', 'slice', 'localizer', 'scout', 'survey',
+  'calibration', 'reference', 'series', 'sequence', 'multi', 'single',
+  'shot', 'turbo', 'susceptibility', 'imaging', 'angiography',
+  'venography', 'tensor', 'functional', 'resting', 'state', 'task',
+  'motor', 'language', 'memory', 'field', 'map', 'phase', 'magnitude',
+  'short', 'long', 'inversion', 'recovery', 'dark', 'bright', 'blood',
+  'vessel', 'wall', 'time', 'flight', 'dynamic', 'static', 'anatomical',
+  'structural', 'localiser', 'repeat', 'redo', 'rescan', 'motion',
+  'corrected', 'raw', 'processed', 'derived', 'left', 'right', 'bilateral',
+  'anterior', 'posterior', 'superior', 'inferior', 'medial', 'lateral',
+  // PET: tracer names and reconstruction terms, so "Amyloid Florbetapir"
+  // or "Attenuation Correction" isn't flagged as a person's name.
+  'pet', 'emission', 'tomography', 'tracer', 'uptake', 'suv', 'frame',
+  'frames', 'attenuation', 'correction', 'reconstruction', 'osem', 'low',
+  'dose', 'list', 'mode', 'amyloid', 'tau', 'fdg', 'fluorodeoxyglucose',
+  'glucose', 'florbetapir', 'amyvid', 'florbetaben', 'neuraceq',
+  'flutemetamol', 'vizamyl', 'flortaucipir', 'tauvid', 'pittsburgh',
+  'compound', 'flumazenil', 'raclopride', 'fluorodopa',
+]);
+
+/** True if a word is common scan/imaging vocabulary, not likely a name token. */
+function isScanVocabWord(word: string): boolean {
+  return SCAN_VOCAB.has(word.toLowerCase());
+}
+
+/** Find bare "Firstname Lastname"-shaped phrases not explained by scan vocabulary. */
+function findBareNameCandidates(value: string): string[] {
+  const matches: string[] = [];
+  const re = /\b([A-Z][a-z]{1,15})\s+([A-Z][a-z]{1,15})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(value)) !== null) {
+    const [full, w1, w2] = m;
+    if (isScanVocabWord(w1) || isScanVocabWord(w2)) continue;
+    matches.push(full);
+  }
+  return matches;
+}
+
+/** Recursively collect {path, value} for every string in a parsed JSON value. */
+function collectStringValues(
+  value: unknown,
+  path: string,
+  out: { path: string; value: string }[],
+): void {
+  if (typeof value === 'string') {
+    if (value.trim().length > 0) out.push({ path, value });
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => collectStringValues(v, `${path}[${i}]`, out));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      if (FIELDS_HANDLED_BY_DEIDENTIFIER.has(key)) continue; // already de-identified on export
+      collectStringValues(v, path ? `${path}.${key}` : key, out);
+    }
+  }
+}
+
+/**
+ * Run the PHI patterns, keywords and (optionally) the bare-name heuristic
+ * over a set of strings from one file. Shared by the sidecar scan and the
+ * TSV table scan so both apply the same rules.
+ */
+function scanStrings(
+  strings: { path: string; value: string }[],
+  result: DetectionResult,
+  { where, bareNames: bareNamesEnabled }: { where: 'sidecar JSON' | 'table' | 'NIfTI header'; bareNames: boolean },
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const untouched = where === 'table'
+    ? 'Table contents are exported as is: NeuroGate does not edit them.'
+    : where === 'NIfTI header'
+      ? 'NIfTI headers are exported as is: NeuroGate does not edit image files.'
+      : 'This free-text field is not changed by automatic de-identification.';
+  const fieldLabel = (path: string) => (where === 'table' ? path : `field "${path}"`);
+  for (const { path, value } of strings) {
+    const normalizedValue = normalizeForPhiMatching(value);
+    for (const phiPattern of PHI_PATTERNS) {
+      if (phiPattern.pattern.test(normalizedValue)) {
+        issues.push({
+          id: nextId(),
+          category: 'phi-risk',
+          severity: phiPattern.severity,
+          title: `Potential ${phiPattern.name} in ${where}`,
+          description: `${phiPattern.description}\n\nFound in ${fieldLabel(path)} of ${result.fileName}. ${untouched} If this is patient data, correct it in the source file, then add the folder again.`,
+          affectedFiles: [result.relativePath],
+          dismissable: phiPattern.severity === 'warning',
+        });
+        break; // one flag per pattern per field is enough
+      }
+    }
+
+    const lowerValue = value.toLowerCase();
+    for (const keyword of PHI_KEYWORDS) {
+      if (lowerValue.includes(keyword)) {
+        issues.push({
+          id: nextId(),
+          category: 'phi-risk',
+          severity: 'warning',
+          title: `PHI keyword detected in ${where}: "${keyword}"`,
+          description: `The keyword "${keyword}" was found in ${fieldLabel(path)} of ${result.fileName}. ${untouched} Please verify no patient-identifying data is present.`,
+          affectedFiles: [result.relativePath],
+          dismissable: true,
+        });
+        break;
+      }
+    }
+
+    const bareNames = bareNamesEnabled ? findBareNameCandidates(value) : [];
+    for (const candidate of bareNames) {
+      issues.push({
+        id: nextId(),
+        category: 'phi-risk',
+        severity: 'warning',
+        title: 'Potential name in sidecar text (unconfirmed)',
+        description: `The phrase "${candidate}" in ${fieldLabel(path)} of ${result.fileName} looks like it could be a person's name. This is a low-confidence heuristic check (it also fires on uncommon scan-vocabulary phrases), so review before dismissing. ${untouched}`,
+        affectedFiles: [result.relativePath],
+        dismissable: true,
+      });
+    }
+  }
+  return issues;
+}
+
+/**
+ * Scan sidecar JSON file content (not just filenames) for PHI patterns.
+ * Complements scanForPhi(), which only looks at filenames/paths.
+ */
+export async function scanSidecarContentForPhi(
+  results: DetectionResult[],
+): Promise<ValidationIssue[]> {
+  const issues: ValidationIssue[] = [];
+  const sidecarResults = results.filter(r => isJsonSidecarFile(r.fileName));
+  if (sidecarResults.length === 0) return issues;
+
+  const scans = await Promise.all(
+    sidecarResults.map(async (result) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await result.file.text());
+      } catch {
+        parsed = undefined;
+      }
+      const isObject = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+      const strings: { path: string; value: string }[] = [];
+      if (isObject) collectStringValues(parsed, '', strings);
+      return { result, strings, isObject };
+    }),
+  );
+
+  for (const { result, strings, isObject } of scans) {
+    // Fail closed: export de-identifies sidecars by parsing them, and
+    // refuses one it can't parse. Say so here, before export, and only
+    // for sidecars that would actually be exported.
+    if (!isObject && isExportedPath(result.bidsPath)) {
+      issues.push({
+        id: nextId(),
+        category: 'file-format',
+        severity: 'error',
+        title: "Sidecar is not valid JSON, so it can't be de-identified",
+        description: `${result.fileName} could not be read as a JSON object, so NeuroGate can't remove identifying fields from it and won't export it. Fix the file (or remove it), then add the folder again.`,
+        affectedFiles: [result.relativePath],
+        dismissable: false,
+      });
+      continue;
+    }
+    issues.push(...scanStrings(strings, result, { where: 'sidecar JSON', bareNames: true }));
+  }
+
+  return issues;
+}
+
+/**
+ * Scan the cells of exported TSV tables (electrodes, channels, events and
+ * other tables) for PHI. Sites often fill these in by hand, and they are
+ * exported unchanged, so a name typed into an events "value" column would
+ * otherwise ship. Purely numeric cells (coordinates, onsets, impedances)
+ * are skipped, and so is the two-capitalized-words name guess, which
+ * would fire on ordinary event labels like "Seizure Onset".
+ */
+export async function scanTsvContentForPhi(results: DetectionResult[]): Promise<ValidationIssue[]> {
+  const tables = results.filter(r => /\.(tsv|csv)$/i.test(r.fileName) && isExportedPath(r.bidsPath));
+  const issues: ValidationIssue[] = [];
+  for (const result of tables) {
+    let text: string;
+    try {
+      text = await result.file.text();
+    } catch {
+      continue;
+    }
+    const rows = readTableRows(text, result.fileName);
+    if (rows.length === 0) continue;
+    const header = rows[0];
+    const strings: { path: string; value: string }[] = [];
+    rows.slice(1).forEach((row, r) => {
+      row.forEach((cell, c) => {
+        const value = cell;
+        if (!value || value === 'n/a' || !Number.isNaN(Number(value))) return;
+        strings.push({ path: `row ${r + 2}, column "${header[c] ?? c + 1}"`, value });
+      });
+    });
+    issues.push(...scanStrings(strings, result, { where: 'table', bareNames: false }));
+  }
+  return issues;
+}
+
+/**
+ * Scan the free-text fields of each exported NIfTI header (descrip,
+ * aux_file) for PHI. NeuroGate doesn't modify image files, so text a
+ * converter or a person put there ships as is. dcm2niix writes numeric
+ * settings into descrip ("TE=30;Time=101502.425;phase=1"); those
+ * key=number pairs are removed first, since a time like 101502.425 would
+ * otherwise look like a phone number.
+ */
+export function scanNiftiHeadersForPhi(results: DetectionResult[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  for (const result of results) {
+    const h = result.niftiHeader;
+    if (!h || !isExportedPath(result.bidsPath)) continue;
+    const strings: { path: string; value: string }[] = [];
+    for (const [path, raw] of [['descrip', h.descrip], ['aux_file', h.auxFile]] as const) {
+      const value = raw.replace(/\b[A-Za-z_]+\s*=\s*[-+]?[\d.]+(?:e[-+]?\d+)?\s*;?/gi, ' ').trim();
+      if (value) strings.push({ path, value });
+    }
+    issues.push(...scanStrings(strings, result, { where: 'NIfTI header', bareNames: true }));
+  }
   return issues;
 }

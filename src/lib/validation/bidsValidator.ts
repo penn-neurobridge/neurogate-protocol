@@ -2,7 +2,7 @@
  * BIDS Structure Validator
  *
  * Checks that the generated BIDS paths and filenames follow the
- * BIDS specification for iEEG/epilepsy data:
+ * BIDS specification for iEEG/neural data:
  *
  * - Correct folder hierarchy: primary/sub-XXX/ses-XXX/modality/
  * - Valid BIDS filename format: sub-XXX_ses-XXX_suffix.ext
@@ -12,9 +12,12 @@
  */
 
 import type { DetectionResult } from '../../types/detection';
+import { isExportedPath } from '../bids/bidsNaming';
 import { getEffectiveSession, getEffectiveModality, getEffectiveSubjectGroup } from '../../types/detection';
 import type { SubjectMetadata } from '../../types/metadata';
+import type { DatasetStructure } from '../../types/sessionStructure';
 import type { ValidationIssue } from '../../types/validation';
+import { isOsJunkFile } from '../detection/extensionDetector';
 
 // Characters not allowed in BIDS filenames/paths (beyond normal filesystem)
 const ILLEGAL_CHARS = /[^a-zA-Z0-9\-_./]/;
@@ -31,7 +34,25 @@ function nextId(): string {
 export function validateBidsStructure(
   results: DetectionResult[],
   subjects: SubjectMetadata[],
+  /**
+   * The dataset's session structure. Needed to recognise the Single
+   * session preset, where a null session is the correct and expected
+   * state rather than a detection failure.
+   *
+   * Without it this function raised a hard, non-dismissable
+   * "No session assigned" error for every file in a sessionless dataset,
+   * which made the Single session preset unusable: the pipeline returns
+   * blocked-by-errors on any error, so such a dataset could never export.
+   * checkRequiredFiles and checkCrossSessionConsistency were already given
+   * the structure for exactly this reason; this check was missed.
+   *
+   * Found 2026-08-17 while testing whether the CLI can export a
+   * single-visit subject in a multi-timepoint study -- the natural
+   * fallback (run it as a single session) was silently impossible.
+   */
+  structure?: DatasetStructure,
 ): ValidationIssue[] {
+  const sessionless = structure?.presetId === 'single-session';
   issueCounter = 0;
   const issues: ValidationIssue[] = [];
 
@@ -50,11 +71,22 @@ export function validateBidsStructure(
     const group = getEffectiveSubjectGroup(result);
     const bidsId = subjectIdMap.get(group) || group; void bidsId;
 
+    // OS junk files (Thumbs.db, .DS_Store, desktop.ini, etc.) are never
+    // real data -- they're excluded from export at the detection layer
+    // already (see isOsJunkFile in extensionDetector.ts). Reporting them
+    // as "Unclassified file" or "Subject has no BIDS ID" is just noise
+    // that obscures the validation issues that actually need attention.
+    // Skip all per-file checks below for these entirely.
+    if (isOsJunkFile(result.fileName)) {
+      continue;
+    }
+
     // ── Check: File has no session assigned ──────────────────
     // Localizer/scout scans are excluded from the BIDS export, so they
     // do not need a session assignment.
     if (
       !session &&
+      !sessionless &&
       modality !== 'other' &&
       modality !== 'localizer' &&
       modality !== 'sidecar-json' &&
@@ -65,7 +97,17 @@ export function validateBidsStructure(
         category: 'bids-structure',
         severity: 'error',
         title: 'No session assigned',
-        description: `"${result.fileName}" has been classified as ${modality} but has no session assigned. Every data file needs a session (ses-preimplant, ses-postimplant, or ses-postsurgery) to be placed in the BIDS folder structure.`,
+        // The session layers already worked out WHY this file has no
+        // session -- folderClusterDetector says, in plain words, "this
+        // subject has 1 visit folder but the study defines 2 timepoints,
+        // most likely a missed visit". That diagnosis was being computed
+        // and then thrown away: the operator saw only "needs a session
+        // assigned", which does not say what to do about it. Surface the
+        // specific reason when there is one.
+        description: `"${result.fileName}" has been classified as ${modality} but has no session assigned. ${
+          result.reasons.find(r => r.layer === 'folder-cluster' || r.layer === 'date-cluster')?.message
+          ?? 'Every data file needs a session assigned to be placed in the BIDS folder structure.'
+        }`,
         affectedFiles: [result.relativePath],
         subjectGroup: group,
         dismissable: false,
@@ -145,6 +187,45 @@ export function validateBidsStructure(
     }
   }
 
+  // ── Check: name collisions renamed to _dup-N ──────────────
+  // computeBidsNames renames a clash to "<name>_dup-N", which keeps both
+  // files but isn't a BIDS name, so it must be resolved before export.
+  for (const result of results) {
+    if (!result.nameCollisionWith) continue;
+    issues.push({
+      id: nextId(),
+      category: 'bids-structure',
+      severity: 'error',
+      title: 'Two files would get the same name',
+      description: `${result.fileName} and ${result.nameCollisionWith.split('/').pop()} would both be exported as the same BIDS file, so one was renamed "${result.bidsFilename}", which isn't a valid BIDS name. Change the subject, session or modality of one of them in the mapping table.`,
+      affectedFiles: [result.nameCollisionWith, result.relativePath],
+      dismissable: false,
+    });
+  }
+
+  // ── Check: files whose modality is only a guess ───────────
+  // They're routed to unclassified/ and left out of the export until the
+  // user picks a modality, which was easy to miss: only a badge in the
+  // mapping table said so.
+  const guessedByGroup = new Map<string, string[]>();
+  for (const result of results) {
+    if (!result.modalityIsGuess || result.userModality) continue;
+    const group = getEffectiveSubjectGroup(result);
+    guessedByGroup.set(group, [...(guessedByGroup.get(group) ?? []), result.relativePath]);
+  }
+  for (const [group, files] of guessedByGroup) {
+    issues.push({
+      id: nextId(),
+      category: 'bids-structure',
+      severity: 'warning',
+      title: `${files.length} file${files.length === 1 ? '' : 's'} with only a guessed modality will not be exported`,
+      description: `NeuroGate couldn't identify what kind of scan ${files.length === 1 ? 'this file is' : 'these files are'}, so ${files.length === 1 ? 'it is' : 'they are'} left out of the export. To include ${files.length === 1 ? 'it' : 'them'}, go back to the mapping table and pick the modality.`,
+      affectedFiles: files,
+      subjectGroup: group,
+      dismissable: true,
+    });
+  }
+
   // ── Check: JSON sidecars should pair with data files ───────
   const jsonSidecars = results.filter(r => getEffectiveModality(r) === 'sidecar-json');
   for (const sidecar of jsonSidecars) {
@@ -165,6 +246,122 @@ export function validateBidsStructure(
         dismissable: true,
       });
     }
+  }
+
+  // ── Unpaired diffusion gradient tables ──────────────────────────
+  // Same idea as the orphaned-JSON check above, for .bval / .bvec.
+  //
+  // bidsNaming pairs a scan with its companions by shared base name, so a
+  // gradient table only follows its image when dcm2niix named them
+  // together. Some sites name them independently -- the Phase2_MRI data
+  // has images called "ep2d_diff_sms_aldit_b1k.nii.gz" with gradients
+  // called "DTI_b1000.bval" one folder up. Those never share a base name,
+  // so each gets its own run entity and the pair is silently split:
+  // "run-1_dwi.bval" ends up describing no exported image, while
+  // "run-13_dwi.nii.gz" ships with no gradients.
+  //
+  // The pairing is NOT guessed here. Inferring "DTI_b1000" belongs to
+  // "..._b1k" means matching on b-value spelling and phase-encoding
+  // suffixes, and a wrong pairing would attach the wrong gradient
+  // directions to a diffusion series -- an error that produces
+  // plausible-looking tractography from the wrong table and is very hard
+  // to spot downstream. Flagging it and letting the user pair or exclude
+  // is the safe behavior. Found 2026-08-17.
+  const gradientFiles = results.filter(r => /\.(bval|bvec)$/i.test(r.fileName));
+  for (const grad of gradientFiles) {
+    // Ask the naming layer's actual outcome rather than re-deriving it.
+    // computeBidsNames pairs a gradient table to its acquisition by base
+    // name first, then by b-value + phase-encoding direction when the
+    // site named them independently (see pairGradientTables in
+    // lib/bids/bidsNaming.ts). A table that still has no export path is
+    // the only one genuinely unplaced.
+    //
+    // This check used to re-test base-name matching on its own, which
+    // meant it kept firing for the 143 tables the b-value pass had
+    // already paired -- 286 stale warnings across the corpus, enough to
+    // bury the real ones.
+    if (isExportedPath(grad.bidsPath)) continue;
+    // No session yet is a separate, already-reported condition; the table
+    // cannot be placed until its subject's session is assigned.
+    if (!getEffectiveSession(grad)) continue;
+
+    issues.push({
+      id: nextId(),
+      category: 'bids-structure',
+      severity: 'warning',
+      title: 'Diffusion gradient table not matched to an image',
+      description: `"${grad.fileName}" is a diffusion gradient table that could not be matched to any diffusion image, either by base name or by b-value and phase-encoding direction. It will not be exported. Confirm which series it belongs to and rename or exclude it; the tool does not guess between multiple candidates, because attaching the wrong gradient directions to a series corrupts the diffusion data silently.`,
+      affectedFiles: [grad.relativePath],
+      dismissable: true,
+    });
+  }
+
+  // ── Same series converted twice ─────────────────────────────────
+  // Flywheel/Scitran exports frequently contain one acquisition under two
+  // names in the same folder: the bare series name, and dcm2niix's
+  // decorated form _<series>_<timestamp>_<seriesNumber>. For example
+  //
+  //   ep2d_diff_sms3_b1000_te94_d64_duty68_BW2264_pF68.nii.gz          (29,772,655 B)
+  //   _ep2d_diff_sms3_b1000_..._20160426130017_4.nii.gz                (29,733,244 B)
+  //
+  // are the same diffusion series converted by two different dcm2niix
+  // runs. Both are exportable, so they receive separate run- entities and
+  // the output asserts two acquisitions where the scanner produced one --
+  // which would double-count the series in any downstream analysis.
+  //
+  // Detection is a deterministic name relationship, not a similarity
+  // guess: stripping the leading underscore and the trailing
+  // _<timestamp>_<number> from one file must yield the other file's exact
+  // base name, in the same folder. Measured over the Phase2_MRI corpus
+  // (2026-08-17) this matched 117 folders / 236 files and did not touch
+  // the 139 folders holding genuinely different images -- magnitude vs.
+  // phase (_ph) and dcm2niix collision variants (trailing "a").
+  //
+  // Nothing is dropped automatically. Both copies are real patient data,
+  // and which to keep is the user's call -- so this reports the pair and
+  // names the copy worth keeping. In 118 of 119 pairs the decorated copy
+  // is the one carrying the .json sidecar (the bare copy never did), and
+  // that sidecar is what the engine reads ImageType from, so it is the
+  // more complete file.
+  const decoratedPattern = /^_(.+)_\d{5,14}_\d+$/;
+  const folderOf = (relativePath: string): string =>
+    relativePath.split('/').slice(0, -1).join('/');
+
+  const imageStem = (fileName: string): string | null => {
+    if (/\.nii\.gz$/i.test(fileName)) return fileName.slice(0, -7);
+    if (/\.nii$/i.test(fileName)) return fileName.slice(0, -4);
+    return null;
+  };
+
+  for (const result of results) {
+    const stem = imageStem(result.fileName);
+    if (!stem) continue;
+    const m = stem.match(decoratedPattern);
+    if (!m) continue;
+
+    const twin = results.find(other => {
+      if (other === result) return false;
+      if (folderOf(other.relativePath) !== folderOf(result.relativePath)) return false;
+      return imageStem(other.fileName) === m[1];
+    });
+    if (!twin) continue;
+
+    const hasSidecar = results.some(
+      r => r.fileName.toLowerCase() === `${stem.toLowerCase()}.json`,
+    );
+
+    issues.push({
+      id: nextId(),
+      category: 'bids-structure',
+      // Informational: the export already keeps exactly one copy. This
+      // exists so the choice is visible and reversible, not because
+      // anything needs fixing.
+      severity: 'info',
+      title: 'Same series present twice',
+      description: `"${twin.fileName}" and "${result.fileName}" are the same acquisition converted twice (the second is dcm2niix's timestamped form of the first, in the same folder). Only one is exported, so the dataset does not double-count the series: "${result.fileName}" is kept${hasSidecar ? ' because it has the matching .json sidecar carrying the scanner metadata' : ''}, and "${twin.fileName}" is set aside as unclassified rather than deleted. If the other copy is the one you want, set its modality in the mapping table and it will be exported instead.`,
+      affectedFiles: [twin.relativePath, result.relativePath],
+      dismissable: true,
+    });
   }
 
   return issues;

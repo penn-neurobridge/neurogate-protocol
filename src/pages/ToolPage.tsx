@@ -1,6 +1,7 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import FileDropZone from '../components/FileDropZone';
+import Button from '../components/Button';
 import MappingTable from '../components/MappingTable';
 import MetadataStep from '../components/MetadataStep';
 import ValidationStep from '../components/ValidationStep';
@@ -8,49 +9,76 @@ import ExportStep from '../components/ExportStep';
 import AuditLogPanel from '../components/AuditLogPanel';
 import NeuralParticles from '../components/NeuralParticles';
 import Wordmark from '../components/Wordmark';
-import type { MetadataOutput } from '../components/MetadataStep';
+import StructureSetupStep from '../components/StructureSetupStep';
+import type { MetadataOutput, MetadataDraft } from '../components/MetadataStep';
 import type { ScannedFile } from '../types/files';
 import type { DetectionResult, DetectionSummary, Session, Modality } from '../types/detection';
-import { getEffectiveSession, getEffectiveModality } from '../types/detection';
-import { runDetection, generateSummary, readJsonSidecars } from '../lib/detection';
+import { getEffectiveSession, getEffectiveModality, taskInBidsName } from '../types/detection';
+import { runDetection, generateSummary, readJsonSidecars, readEdfHeaders, readNiftiHeaders } from '../lib/detection';
 import { computeBidsNames } from '../lib/bids/bidsNaming';
-import { useAudit, downloadAuditJson } from '../lib/audit';
+import { useAudit, auditJsonFiles, buildAuditRedactionPairs, downloadFile } from '../lib/audit';
+import type { DatasetStructure } from '../types/sessionStructure';
+import { createDefaultDatasetStructure, resolveSessionIds } from '../types/sessionStructure';
 import {
   saveToolSession,
   loadToolSession,
   clearToolSession,
+  saveSessionMetadata,
+  loadSessionMetadata,
   trySessionRestore,
   formatSavedAt,
   type PersistedSession,
 } from '../lib/session/toolSession';
 
-type AppStep = 'drop' | 'scanning' | 'mapping' | 'metadata' | 'validation' | 'export';
+type AppStep = 'structure' | 'drop' | 'scanning' | 'mapping' | 'metadata' | 'validation' | 'export';
 
 function ToolPage() {
-  const [step, setStep] = useState<AppStep>('drop');
+  // A session saved in this tab (sessionStorage) is read once, before the
+  // first render: it implies a structure was already chosen, so the tool
+  // starts at the drop zone (where the restore banner lives) instead of
+  // asking again.
+  const [initialSaved] = useState<PersistedSession | null>(() => loadToolSession());
+  const [step, setStep] = useState<AppStep>(initialSaved ? 'drop' : 'structure');
+  const [datasetStructure, setDatasetStructure] = useState<DatasetStructure>(
+    () => initialSaved?.structure ?? createDefaultDatasetStructure(),
+  );
+  // Phase 2 addition (August 2026): datasetStructure always holds a real
+  // value (defaults to the Implant preset via createDefaultDatasetStructure
+  // above), even before the user has actually chosen anything on the
+  // Structure step. StructureSetupStep's Step 0 gate needs to tell "the
+  // user already confirmed a structure" apart from "this is just the
+  // fallback default" -- passing the default value as initialStructure
+  // would make the gate think a real choice (Implant) was already made
+  // and skip straight past the Yes/No question on every first visit.
+  // structureChosen tracks the former explicitly.
+  const [structureChosen, setStructureChosen] = useState(Boolean(initialSaved?.structure));
   const [scannedFiles, setScannedFiles] = useState<ScannedFile[]>([]);
   const [detectionResults, setDetectionResults] = useState<DetectionResult[]>([]);
   const [summary, setSummary] = useState<DetectionSummary | null>(null);
   const [metadataOutput, setMetadataOutput] = useState<MetadataOutput | null>(null);
+  // What was typed on the Metadata step, restored when the user returns
+  // to it (it is recreated on every visit).
+  const [metadataDraft, setMetadataDraft] = useState<MetadataDraft | null>(null);
   const [auditPanelOpen, setAuditPanelOpen] = useState(false);
-  const [savedSession, setSavedSession] = useState<PersistedSession | null>(null);
+  const [savedSession, setSavedSession] = useState<PersistedSession | null>(initialSaved);
 
   const audit = useAudit();
-
-  // ── Save/resume: on mount, check for a sessionStorage-saved session ──
-  useEffect(() => {
-    const saved = loadToolSession();
-    if (saved) setSavedSession(saved);
-  }, []);
+  // The Metadata values last written to the audit log (see handleMetadataComplete).
+  const loggedMetadata = useRef<MetadataOutput | null>(null);
 
   // ── Save/resume: persist on every detection-state change ──────────────
-  // Only file mappings and detection results are persisted, never metadata
-  // step contents. SessionStorage clears when the tab closes.
+  // File mappings and detection results; the Metadata entries are saved
+  // beside them (saveMetadataEntries). SessionStorage clears when the tab
+  // closes.
   useEffect(() => {
     if (detectionResults.length > 0 && summary) {
-      saveToolSession(detectionResults, summary);
+      saveToolSession(detectionResults, summary, datasetStructure);
     }
-  }, [detectionResults, summary]);
+  }, [detectionResults, summary, datasetStructure]);
+
+  const saveMetadataEntries = useCallback((draft: MetadataDraft) => {
+    saveSessionMetadata({ draft, logged: loggedMetadata.current });
+  }, []);
 
   const handleDiscardSavedSession = useCallback(() => {
     clearToolSession();
@@ -68,14 +96,23 @@ function ToolPage() {
     if (savedSession) {
       const restored = trySessionRestore(files, savedSession);
       if (restored) {
-        setDetectionResults(computeBidsNames(restored));
+        setDetectionResults(computeBidsNames(restored, undefined, savedSession.structure ?? datasetStructure));
         setSummary(savedSession.summary);
+        if (savedSession.structure) {
+          setDatasetStructure(savedSession.structure);
+          setStructureChosen(true);
+        }
         setStep('mapping');
         setSavedSession(null);
+        const savedMetadata = loadSessionMetadata<MetadataDraft, MetadataOutput>();
+        if (savedMetadata) {
+          setMetadataDraft(savedMetadata.draft);
+          loggedMetadata.current = savedMetadata.logged;
+        }
         audit.addEntry(
           'session-restored',
-          `Resumed prior session: ${restored.length} files restored from saved state`,
-          { fileCount: restored.length },
+          `Resumed prior session: ${restored.length} files restored from saved state` + (savedMetadata ? ', with Metadata entries' : ''),
+          { fileCount: restored.length, metadataRestored: Boolean(savedMetadata) },
           'system',
         );
         return;
@@ -91,11 +128,17 @@ function ToolPage() {
 
     // Run detection engine (small delay so the UI shows the scanning state)
     setTimeout(async () => {
-      // Read any dcm2niix JSON sidecars first so the engine can use the
-      // scanner's original scan names to classify generic NIfTI files.
-      const sidecarMap = await readJsonSidecars(files);
-      const results = runDetection(files, sidecarMap);
-      const sum = generateSummary(results);
+      // Read JSON sidecars, EDF headers and NIfTI headers in parallel
+      // before running the detection engine, so every source of in-file
+      // metadata is available to resolve ambiguous filenames (e.g.
+      // "HUP282.edf", "series_7.nii.gz").
+      const [sidecarMap, edfHeaderMap, niftiHeaderMap] = await Promise.all([
+        readJsonSidecars(files),
+        readEdfHeaders(files),
+        readNiftiHeaders(files),
+      ]);
+      const results = runDetection(files, sidecarMap, edfHeaderMap, datasetStructure, niftiHeaderMap);
+      const sum = generateSummary(results, datasetStructure);
       setDetectionResults(results);
       setSummary(sum);
       setStep('mapping');
@@ -110,7 +153,7 @@ function ToolPage() {
         sum.subjectGroups,
       );
     }, 500);
-  }, [audit, savedSession]);
+  }, [audit, savedSession, datasetStructure]);
 
   // ── Update a single detection result (user correction) ────────
   const handleUpdateResult = useCallback((index: number, updates: Partial<DetectionResult>) => {
@@ -132,11 +175,28 @@ function ToolPage() {
 
       // Recompute BIDS names so the preview, run- entities, and sidecar
       // pairing stay correct after the change.
-      const renamed = computeBidsNames(next);
-      setSummary(generateSummary(renamed));
+      const renamed = computeBidsNames(next, undefined, datasetStructure);
+      if ('userTask' in updates) {
+        const from = taskInBidsName(old.bidsFilename);
+        const to = taskInBidsName(renamed[index].bidsFilename);
+        if (to && from !== to) audit.logTaskCorrected(old.fileName, from, to);
+      }
+      setSummary(generateSummary(renamed, datasetStructure));
       return renamed;
     });
-  }, [audit]);
+  }, [audit, datasetStructure]);
+
+  // ── Bulk set the task label ──────────────────────────────────
+  const handleBulkUpdateTask = useCallback((indices: number[], task: string) => {
+    setDetectionResults(prev => {
+      const next = [...prev];
+      for (const i of indices) next[i] = { ...next[i], userTask: task };
+      const renamed = computeBidsNames(next, undefined, datasetStructure);
+      setSummary(generateSummary(renamed, datasetStructure));
+      return renamed;
+    });
+    audit.logBulkTaskApplied(indices.length, task);
+  }, [audit, datasetStructure]);
 
   // ── Bulk update session for selected files ────────────────────
   const handleBulkUpdateSession = useCallback((indices: number[], session: Session) => {
@@ -145,12 +205,12 @@ function ToolPage() {
       for (const i of indices) {
         next[i] = { ...next[i], userSession: session };
       }
-      const renamed = computeBidsNames(next);
-      setSummary(generateSummary(renamed));
+      const renamed = computeBidsNames(next, undefined, datasetStructure);
+      setSummary(generateSummary(renamed, datasetStructure));
       return renamed;
     });
     audit.logBulkSessionApplied(indices.length, session);
-  }, [audit]);
+  }, [audit, datasetStructure]);
 
   // ── Bulk update modality for selected files ───────────────────
   const handleBulkUpdateModality = useCallback((indices: number[], modality: Modality) => {
@@ -159,32 +219,85 @@ function ToolPage() {
       for (const i of indices) {
         next[i] = { ...next[i], userModality: modality };
       }
-      const renamed = computeBidsNames(next);
-      setSummary(generateSummary(renamed));
+      const renamed = computeBidsNames(next, undefined, datasetStructure);
+      setSummary(generateSummary(renamed, datasetStructure));
       return renamed;
     });
     audit.logBulkModalityApplied(indices.length, modality);
-  }, [audit]);
+  }, [audit, datasetStructure]);
 
   // ── Handle metadata completion ────────────────────────────────
   const handleMetadataComplete = useCallback((metadata: MetadataOutput) => {
+    const previous = loggedMetadata.current;
+    loggedMetadata.current = metadata;
     setMetadataOutput(metadata);
+    setMetadataDraft(metadata);
+    saveSessionMetadata({ draft: metadata, logged: metadata });
     setStep('validation');
 
-    // Log metadata entries
-    audit.logInstitutionConfigured(metadata.institutionConfig.prefix, metadata.institutionConfig.startingNumber);
+    // Log metadata entries -- only what changed since the last time this
+    // step was completed, so going back and forth doesn't repeat entries.
+    const inst = metadata.institutionConfig;
+    if (!previous || previous.institutionConfig.prefix !== inst.prefix || previous.institutionConfig.startingNumber !== inst.startingNumber) {
+      audit.logInstitutionConfigured(inst.prefix, inst.startingNumber);
+    }
 
+    const previousSubjects = new Map(previous?.subjects.map(s => [s.bidsSubjectId, s.sessions.length]) ?? []);
     for (const subject of metadata.subjects) {
-      audit.logSubjectMetadataEntered(subject.bidsSubjectId, subject.sessions.length);
+      if (previousSubjects.get(subject.bidsSubjectId) !== subject.sessions.length) {
+        audit.logSubjectMetadataEntered(subject.bidsSubjectId, subject.sessions.length);
+      }
     }
 
-    const filledAuthors = metadata.datasetDescription.authors.filter(a => a.trim()).length;
-    audit.logDatasetDescriptionEntered(metadata.datasetDescription.name, filledAuthors);
-
-    if (metadata.defacingAttestation.confirmed) {
-      audit.logDefacingAttested();
+    const desc = metadata.datasetDescription;
+    const filledAuthors = desc.authors.filter(a => a.trim());
+    const previousAuthors = previous?.datasetDescription.authors.filter(a => a.trim()) ?? null;
+    if (!previous || previous.datasetDescription.name !== desc.name || previousAuthors?.join('\n') !== filledAuthors.join('\n')) {
+      audit.logDatasetDescriptionEntered(desc.name, filledAuthors.length);
     }
+    // The defacing attestation is logged by MetadataStep when the box is
+    // ticked or unticked.
   }, [audit]);
+
+  // ── Change structure ─────────────────────────────────────────
+  // The structure decides every session label, so changing it means
+  // starting the files over. Offered from Drop Files and Mapping. The
+  // audit log is kept and records the switch.
+  const [changingFrom, setChangingFrom] = useState<DatasetStructure | null>(null);
+  const [confirmingChange, setConfirmingChange] = useState(false);
+
+  const beginChangeStructure = useCallback(() => {
+    setConfirmingChange(false);
+    setChangingFrom(datasetStructure);
+    setScannedFiles([]);
+    setDetectionResults([]);
+    setSummary(null);
+    setMetadataOutput(null);
+    setMetadataDraft(null);
+    loggedMetadata.current = null;
+    clearToolSession();
+    setSavedSession(null);
+    setStep('structure');
+  }, [datasetStructure]);
+
+  const requestChangeStructure = useCallback(() => {
+    if (scannedFiles.length > 0) setConfirmingChange(true);
+    else beginChangeStructure();
+  }, [scannedFiles.length, beginChangeStructure]);
+
+  const changeStructureConfirm = confirmingChange && (
+    <div className="max-w-3xl mx-auto mb-6 rounded-lg border border-amber-200 bg-amber-50 p-4">
+      <p className="text-sm font-semibold text-amber-800">Change the structure?</p>
+      <p className="text-sm text-amber-700 mt-1">
+        The files you added and your corrections will be cleared, and you'll add the folder again
+        after choosing the new structure. The audit log is kept.
+      </p>
+      <div className="flex gap-3 mt-3">
+        <Button variant="primary" onClick={beginChangeStructure}>Change structure and clear files</Button>
+        <Button variant="secondary" onClick={() => setConfirmingChange(false)}>Keep working</Button>
+      </div>
+    </div>
+  );
 
   // ── Reset to start ───────────────────────────────────────────
   const handleStartOver = useCallback(() => {
@@ -193,6 +306,8 @@ function ToolPage() {
     setDetectionResults([]);
     setSummary(null);
     setMetadataOutput(null);
+    setMetadataDraft(null);
+    loggedMetadata.current = null;
     clearToolSession();
     setSavedSession(null);
   }, []);
@@ -200,11 +315,12 @@ function ToolPage() {
   // ── Get current step number for the indicator ─────────────────
   const stepNumber = (s: AppStep): number => {
     switch (s) {
-      case 'drop': case 'scanning': return 1;
-      case 'mapping': return 2;
-      case 'metadata': return 3;
-      case 'validation': return 4;
-      case 'export': return 5;
+      case 'structure': return 1;
+      case 'drop': case 'scanning': return 2;
+      case 'mapping': return 3;
+      case 'metadata': return 4;
+      case 'validation': return 5;
+      case 'export': return 6;
     }
   };
 
@@ -232,7 +348,7 @@ function ToolPage() {
             <div>
               <Wordmark size="lg" />
               <p className="hidden md:block text-sm mt-1 text-blue-200">
-                Multi-site neural data compliance tool for epilepsy
+                Multi-site neural data compliance tool
               </p>
             </div>
           </Link>
@@ -240,10 +356,11 @@ function ToolPage() {
           {/* Mobile-only compact step label */}
           <div className="flex md:hidden flex-col items-end text-right">
             <span className="text-[10px] uppercase tracking-widest text-blue-200">
-              Step {stepNumber(step)} of 5
+              Step {stepNumber(step)} of 6
             </span>
             <span className="text-xs font-semibold text-[#6DD3CE]">
-              {step === 'drop' || step === 'scanning' ? 'Drop Files' :
+              {step === 'structure' ? 'Structure' :
+                step === 'drop' || step === 'scanning' ? 'Drop Files' :
                 step === 'mapping' ? 'Mapping' :
                 step === 'metadata' ? 'Metadata' :
                 step === 'validation' ? 'Validate' :
@@ -254,11 +371,12 @@ function ToolPage() {
           {/* Desktop-only step indicator */}
           <div className="hidden md:flex items-center text-sm">
               {[
-                { num: 1, label: 'Drop Files' },
-                { num: 2, label: 'Mapping' },
-                { num: 3, label: 'Metadata' },
-                { num: 4, label: 'Validate' },
-                { num: 5, label: 'Export' },
+                { num: 1, label: 'Structure' },
+                { num: 2, label: 'Drop Files' },
+                { num: 3, label: 'Mapping' },
+                { num: 4, label: 'Metadata' },
+                { num: 5, label: 'Validate' },
+                { num: 6, label: 'Export' },
               ].map((s, i) => {
                 const current = stepNumber(step);
                 const isCompleted = current > s.num;
@@ -312,7 +430,7 @@ function ToolPage() {
           {/* Audit log button (always visible) */}
           <button
             onClick={() => setAuditPanelOpen(true)}
-            className="relative flex-shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg transition-all bg-white/15 text-white hover:bg-white/25"
+            className="btn-cta relative flex-shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg transition-all bg-white/15 text-white hover:bg-white/25"
             aria-label="Open audit log panel"
           >
             <span className="hidden sm:inline">Audit Log</span>
@@ -336,7 +454,41 @@ function ToolPage() {
         {/* Screen-reader page title (the visible brand mark is the wordmark) */}
         <h1 className="sr-only">NeuroGate Protocol: neural data organization tool</h1>
 
-        {/* Step 1: Drop zone */}
+        {/* Step 1: Dataset structure setup */}
+        {step === 'structure' && changingFrom && (
+          <div className="max-w-3xl mx-auto mb-4 flex justify-end">
+            <button
+              type="button"
+              onClick={() => { setChangingFrom(null); setStep('drop'); }}
+              className="btn-cta text-sm font-medium text-gray-500 hover:text-gray-800"
+            >
+              Cancel, keep the current structure
+            </button>
+          </div>
+        )}
+        {step === 'structure' && (
+          <StructureSetupStep
+            key={changingFrom ? 'changing' : 'first'}
+            initialStructure={structureChosen ? datasetStructure : undefined}
+            onContinue={(structure) => {
+              const sessionIds = resolveSessionIds(structure);
+              if (changingFrom) {
+                audit.logStructureChanged(
+                  { presetId: changingFrom.presetId, sessionIds: resolveSessionIds(changingFrom) },
+                  { presetId: structure.presetId, sessionIds },
+                );
+                setChangingFrom(null);
+              } else {
+                audit.logStructureSelected(structure.presetId, sessionIds.length, sessionIds);
+              }
+              setDatasetStructure(structure);
+              setStructureChosen(true);
+              setStep('drop');
+            }}
+          />
+        )}
+
+        {/* Step 2: Drop zone */}
         {step === 'drop' && (
           <div>
             {/* Hero section */}
@@ -346,7 +498,7 @@ function ToolPage() {
               </h2>
               <p className="mt-3 max-w-lg mx-auto text-base leading-relaxed text-gray-500">
                 Drop your patient data folder to auto-detect sessions and modalities,
-                validate BIDS compliance, and export a ready-to-upload dataset.
+                validate it, and export a ready-to-share BIDS-based dataset.
               </p>
             </div>
 
@@ -381,14 +533,14 @@ function ToolPage() {
                   <p className="text-xs text-gray-600 mt-1 leading-relaxed">
                     You had {savedSession.fileSignatures.length}{' '}
                     {savedSession.fileSignatures.length === 1 ? 'file' : 'files'} mapped.
-                    Re-drop the same folder to pick up where you left off, or click Discard to
-                    start fresh. Subject metadata is not saved and will need to be re-entered.
+                    Add the same folder again to pick up where you left off, with your corrections
+                    and Metadata entries, or click Discard to start fresh.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={handleDiscardSavedSession}
-                  className="text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors flex-shrink-0"
+                  className="btn-cta text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors flex-shrink-0"
                   style={{ color: '#0F6E56', backgroundColor: 'rgba(255,255,255,0.6)' }}
                 >
                   Discard
@@ -398,12 +550,22 @@ function ToolPage() {
 
             <FileDropZone onFilesScanned={handleFilesScanned} />
 
+            <p className="text-center text-xs text-gray-500 mt-4">
+              Structure: {datasetStructure.presetId === 'custom-timepoints'
+                ? `Custom timepoints (${resolveSessionIds(datasetStructure).join(', ')})`
+                : datasetStructure.presetId === 'single-session' ? 'Single session' : 'Implant sessions'}
+              {' · '}
+              <button type="button" onClick={requestChangeStructure} className="btn-cta font-medium underline" style={{ color: '#011F5B' }}>
+                Change structure
+              </button>
+            </p>
+
             {/* Feature cards below drop zone */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-10 max-w-3xl mx-auto">
               {[
                 {
                   title: 'Auto-Detection',
-                  desc: '5-layer engine identifies sessions, modalities, and subject groups',
+                  desc: 'Reads file names, folders, JSON sidecars and EDF headers to identify sessions, modalities and subjects',
                   accent: '#00d4ff',
                 },
                 {
@@ -412,8 +574,8 @@ function ToolPage() {
                   accent: '#ff6b6b',
                 },
                 {
-                  title: 'ALCOA+ Audit Trail',
-                  desc: 'Every correction and decision is logged for regulatory compliance',
+                  title: 'Audit Trail',
+                  desc: 'Your mapping corrections, metadata and export are logged in an ALCOA+-aligned audit log',
                   accent: '#00d4ff',
                 },
               ].map((feat) => (
@@ -450,15 +612,21 @@ function ToolPage() {
 
         {/* Step 2: Mapping table */}
         {step === 'mapping' && summary && (
+          <>
+          {changeStructureConfirm}
           <MappingTable
             results={detectionResults}
             summary={summary}
             onUpdateResult={handleUpdateResult}
             onBulkUpdateSession={handleBulkUpdateSession}
             onBulkUpdateModality={handleBulkUpdateModality}
+            onBulkUpdateTask={handleBulkUpdateTask}
             onContinue={() => setStep('metadata')}
             onBack={handleStartOver}
+            onChangeStructure={requestChangeStructure}
+            structure={datasetStructure}
           />
+          </>
         )}
 
         {/* Step 3: Metadata */}
@@ -467,7 +635,10 @@ function ToolPage() {
             detectionResults={detectionResults}
             scannedFiles={scannedFiles}
             onContinue={handleMetadataComplete}
-            onBack={() => setStep('mapping')}
+            onBack={(draft) => { setMetadataDraft(draft); setStep('mapping'); }}
+            onDraftChange={saveMetadataEntries}
+            initialDraft={metadataDraft ?? undefined}
+            structure={datasetStructure}
           />
         )}
 
@@ -479,11 +650,18 @@ function ToolPage() {
             datasetDescription={metadataOutput.datasetDescription}
             defacingAttestation={metadataOutput.defacingAttestation}
             institutionConfig={metadataOutput.institutionConfig}
-            onContinue={() => {
-              audit.addEntry('validation-passed', 'Validation passed, proceeding to export', {
-                subjectCount: metadataOutput!.subjects.length,
-                fileCount: detectionResults.length,
-              }, 'system');
+            structure={datasetStructure}
+            onContinue={(dismissed) => {
+              const errors = dismissed.filter(i => i.severity === 'error').length;
+              audit.addEntry('validation-passed',
+                dismissed.length === 0
+                  ? 'Validation passed, proceeding to export'
+                  : `Validation passed with ${dismissed.length} dismissed issue${dismissed.length !== 1 ? 's' : ''} (${errors} error${errors !== 1 ? 's' : ''}), proceeding to export`,
+                {
+                  subjectCount: metadataOutput!.subjects.length,
+                  fileCount: detectionResults.length,
+                  dismissedIssues: dismissed.map(i => ({ severity: i.severity, category: i.category, title: i.title, affectedFiles: i.affectedFiles })),
+                }, 'system');
               setStep('export');
             }}
             onBack={() => setStep('metadata')}
@@ -496,16 +674,38 @@ function ToolPage() {
             subjects={metadataOutput.subjects}
             datasetDescription={metadataOutput.datasetDescription}
             institutionConfig={metadataOutput.institutionConfig}
+            structure={datasetStructure}
             onBack={() => setStep('validation')}
-            onExportComplete={() => {
-              // Record the export event in the audit log BEFORE downloading,
-              // so the downloaded audit file includes the export-completed
-              // entry that documents itself.
-              audit.addEntry('export-completed', 'BIDS dataset exported as ZIP', {
-                subjectCount: metadataOutput!.subjects.length,
-                fileCount: detectionResults.length,
-              }, 'system');
-              downloadAuditJson(audit, 'user');
+            onExportComplete={async (deidentifySummary, destination) => {
+              // Record the de-identification summary and the export event
+              // in the audit log BEFORE saving it, so the saved audit file
+              // documents both actions itself.
+              audit.logDeidentificationSummary(deidentifySummary);
+              audit.addEntry(
+                'export-completed',
+                destination ? 'BIDS dataset exported to folder' : 'BIDS dataset exported as ZIP',
+                {
+                  subjectCount: metadataOutput!.subjects.length,
+                  fileCount: detectionResults.length,
+                },
+                'system',
+              );
+              // Two audit files: the full log (original names, keep at the
+              // site) and a shareable copy with names replaced by their
+              // exported BIDS names. Desktop folder export: both go into
+              // the export folder next to bids_output/, like the CLI.
+              // Browser ZIP: both download as separate files.
+              const idMap = new Map(metadataOutput!.subjects.map(s => [s.subjectGroup, s.bidsSubjectId]));
+              const named = computeBidsNames(detectionResults, idMap, datasetStructure);
+              const { full, shareable, throughId } = auditJsonFiles(audit, 'user', buildAuditRedactionPairs(named, metadataOutput!.subjects));
+              if (destination && window.neurogateDesktop) {
+                await window.neurogateDesktop.writeExportFile(destination.outputDir, full.name, full.text);
+                await window.neurogateDesktop.writeExportFile(destination.outputDir, shareable.name, shareable.text);
+              } else {
+                downloadFile(full.text, full.name, 'application/json');
+                downloadFile(shareable.text, shareable.name, 'application/json');
+              }
+              audit.markSaved(throughId);
             }}
           />
         )}

@@ -2,7 +2,7 @@
  * Required Files Checker
  *
  * Verifies that each subject/session combination has the required
- * files per the epilepsy BIDS specification:
+ * files for the Implant sessions preset:
  *
  * ses-preimplant:
  *   - Required: T1w MRI (anat/)
@@ -24,6 +24,9 @@ import type { DetectionResult } from '../../types/detection';
 import { getEffectiveSession, getEffectiveModality, getEffectiveSubjectGroup } from '../../types/detection';
 import type { SubjectMetadata } from '../../types/metadata';
 import type { ValidationIssue } from '../../types/validation';
+import { isOsJunkFile } from '../detection/extensionDetector';
+import type { DatasetStructure } from '../../types/sessionStructure';
+import { isExportedPath } from '../bids/bidsNaming';
 
 interface RequiredFile {
   modality: string;
@@ -57,9 +60,31 @@ function nextId(): string {
 export function checkRequiredFiles(
   results: DetectionResult[],
   subjects: SubjectMetadata[],
+  /**
+   * The dataset's chosen session structure. Optional so existing callers
+   * that don't pass it see identical behavior to before Phase 2. Only
+   * consulted for the "Subject has no sessions at all" check below --
+   * for the Single session preset every file legitimately has session =
+   * null, so that check would otherwise fire a false "error" on every
+   * single subject in a normal single-session upload.
+   */
+  structure?: DatasetStructure,
 ): ValidationIssue[] {
   issueCounter = 0;
   const issues: ValidationIssue[] = [];
+
+  // OS junk files (Thumbs.db, .DS_Store, etc.) are never real data and
+  // are already excluded from export at the detection layer. Keeping
+  // them out of this checker's inputs entirely stops them from padding
+  // out "Missing required" affectedFiles lists or spuriously triggering
+  // "Subject has no sessions" for a junk-only file group.
+  results = results.filter(r => !isOsJunkFile(r.fileName));
+
+  const DATA_MODALITIES = new Set([
+    'anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-PDw', 'anat-T2starw', 'anat-angio',
+    'ct', 'pet', 'dwi', 'perf', 'func', 'fmap',
+    'ieeg', 'eeg', 'electrodes', 'channels', 'events',
+  ]);
 
   // Build a map: subjectGroup → session → list of modalities present
   const subjectSessionModalities = new Map<string, Map<string, Set<string>>>();
@@ -78,7 +103,11 @@ export function checkRequiredFiles(
     if (!sessionMap.has(session)) {
       sessionMap.set(session, new Set());
     }
-    sessionMap.get(session)!.add(modality);
+    // The session counts as present either way, but only a file that will
+    // actually be exported can satisfy a requirement: a guessed T1w (or a
+    // redundant copy) is left out of the export, so it must not count as
+    // "T1w present".
+    if (isExportedPath(result.bidsPath)) sessionMap.get(session)!.add(modality);
   }
 
   // ── Check each subject's sessions against requirements ────
@@ -86,6 +115,17 @@ export function checkRequiredFiles(
     // Find the BIDS ID for display
     const subject = subjects.find(s => s.subjectGroup === group);
     const displayId = subject?.bidsSubjectId || group;
+
+    // Count data files for this subject across all sessions.
+    // When a subject has very few files it is almost certainly an
+    // intentional partial upload (e.g. a single EDF for de-identification).
+    // Downgrade required-file errors to dismissable warnings in that case
+    // so the user can still proceed to export.
+    const subjectDataFileCount = results.filter(r =>
+      getEffectiveSubjectGroup(r) === group &&
+      DATA_MODALITIES.has(getEffectiveModality(r))
+    ).length;
+    const isSparseUpload = subjectDataFileCount < 4;
 
     for (const [session, modalities] of sessionMap) {
       const requirements = SESSION_REQUIREMENTS[session];
@@ -97,20 +137,28 @@ export function checkRequiredFiles(
             .filter(r => getEffectiveSubjectGroup(r) === group && getEffectiveSession(r) === session)
             .map(r => r.relativePath);
 
+          // For sparse uploads, treat all missing-file issues as dismissable
+          // warnings so the user is not blocked from exporting the files
+          // they do have (e.g. a single EDF being de-identified).
+          const effectiveSeverity: 'error' | 'warning' =
+            isSparseUpload ? 'warning' : req.severity;
+
           issues.push({
             id: nextId(),
             category: 'required-files',
-            severity: req.severity,
-            title: req.severity === 'error'
+            severity: effectiveSeverity,
+            title: effectiveSeverity === 'error'
               ? `Missing required: ${req.label}`
-              : `Recommended: ${req.label}`,
-            description: req.severity === 'error'
-              ? `${displayId} / ${session} is missing a required ${req.label} file. This file must be present for a valid BIDS submission. If you have this file, go back to the mapping step and verify it's assigned to the correct session and modality.`
-              : `${displayId} / ${session} does not include a ${req.label} file. This is recommended but not required. Your submission will still be valid without it.`,
+              : `Missing: ${req.label}`,
+            description: isSparseUpload
+              ? `${displayId} / ${session} is missing ${req.label}, but only ${subjectDataFileCount} file${subjectDataFileCount === 1 ? ' was' : 's were'} added for this subject. If this is intentional (e.g. exporting a single file for de-identification), dismiss this warning and continue. Otherwise go back and verify all files were included.`
+              : effectiveSeverity === 'error'
+                ? `${displayId} / ${session} is missing a required ${req.label} file. This file must be present for a valid BIDS submission. If you have this file, go back to the mapping step and verify it's assigned to the correct session and modality.`
+                : `${displayId} / ${session} does not include a ${req.label} file. This is recommended but not required. Your submission will still be valid without it.`,
             affectedFiles,
             subjectGroup: group,
             session,
-            dismissable: req.severity === 'warning',
+            dismissable: true,
           });
         }
       }
@@ -118,7 +166,12 @@ export function checkRequiredFiles(
   }
 
   // ── Check: Subjects with no sessions at all ───────────────
-  const allGroups = new Set(results.map(r => getEffectiveSubjectGroup(r)));
+  // Skipped entirely for the Single session preset: session = null is
+  // that preset's normal, expected state for every file, not a sign that
+  // something failed to get assigned.
+  const allGroups = structure?.presetId === 'single-session'
+    ? new Set<string>()
+    : new Set(results.map(r => getEffectiveSubjectGroup(r)));
   for (const group of allGroups) {
     if (!subjectSessionModalities.has(group) ||
         subjectSessionModalities.get(group)!.size === 0) {
@@ -131,7 +184,7 @@ export function checkRequiredFiles(
         category: 'required-files',
         severity: 'error',
         title: 'Subject has no sessions',
-        description: `Subject group "${group}" has files but none are assigned to a session. Every file needs to be assigned to ses-preimplant, ses-postimplant, or ses-postsurgery.`,
+        description: `Subject group "${group}" has files but none are assigned to a session. Every file needs to be assigned to one of this dataset's sessions.`,
         affectedFiles,
         subjectGroup: group,
         dismissable: false,

@@ -1,5 +1,39 @@
 import { useState, useCallback, useRef } from 'react';
 import type { ScannedFile } from '../types/files';
+import { cacheFileBuffer, markUnreadable } from '../lib/fileCache';
+
+/**
+ * Matches LARGE_FILE_THRESHOLD_BYTES in lib/bids/exporter.ts: a browser
+ * leaves files above this out of the ZIP, so there's no point caching
+ * them -- and reading a multi-GB file into memory would fail anyway.
+ */
+const BROWSER_CACHE_LIMIT_BYTES = 500 * 1024 * 1024;
+
+/**
+ * Get a dropped/browsed file ready for export. Returns false if it
+ * can't be read (e.g. a cloud-only OneDrive file not downloaded locally).
+ *
+ * Desktop app: files are never loaded into memory. Export streams them
+ * from their path on disk (see lib/adapters/desktopExport.ts), so all
+ * that's needed is that the path is known -- this is what lets multi-GB
+ * EDF recordings through.
+ *
+ * Browser: eagerly cache the content, since drag-and-drop File handles
+ * can lose read permission by the time the user reaches export.
+ */
+async function prepareFile(file: File): Promise<boolean> {
+  const desktop = window.neurogateDesktop;
+  if (desktop?.getPathForFile) {
+    return Boolean(desktop.getPathForFile(file));
+  }
+  if (file.size > BROWSER_CACHE_LIMIT_BYTES) return true;
+  try {
+    cacheFileBuffer(file, await file.arrayBuffer());
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 interface FileDropZoneProps {
   onFilesScanned: (files: ScannedFile[]) => void;
@@ -16,6 +50,7 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   /** Extract files from a DataTransferItem using webkitGetAsEntry for folder support */
   const scanDataTransferItems = useCallback(async (items: DataTransferItemList): Promise<ScannedFile[]> => {
@@ -27,6 +62,10 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
         const file = await new Promise<File>((resolve, reject) => {
           fileEntry.file(resolve, reject);
         });
+        if (!(await prepareFile(file))) {
+          // Tag unreadable files so the UI can warn the user up front.
+          markUnreadable(file);
+        }
         files.push({
           relativePath: path + file.name,
           name: file.name,
@@ -67,12 +106,14 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
   }, []);
 
   /** Handle files from the <input> fallback (webkitdirectory) */
-  const scanInputFiles = useCallback((fileList: FileList): ScannedFile[] => {
+  const scanInputFiles = useCallback(async (fileList: FileList): Promise<ScannedFile[]> => {
     const files: ScannedFile[] = [];
     for (let i = 0; i < fileList.length; i++) {
       const file = fileList[i];
+      // Unreadable files surface at export time.
+      await prepareFile(file);
       files.push({
-        relativePath: (file as any).webkitRelativePath || file.name,
+        relativePath: file.webkitRelativePath || file.name,
         name: file.name,
         size: file.size,
         file,
@@ -96,12 +137,22 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
     }
   }, [scanDataTransferItems, onFilesScanned]);
 
-  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleInputChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
     setIsScanning(true);
-    const scanned = scanInputFiles(e.target.files);
+    const scanned = await scanInputFiles(e.target.files);
     onFilesScanned(scanned);
     setIsScanning(false);
+    e.target.value = '';
+  }, [scanInputFiles, onFilesScanned]);
+
+  const handleFileInputChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files?.length) return;
+    setIsScanning(true);
+    const scanned = await scanInputFiles(e.target.files);
+    onFilesScanned(scanned);
+    setIsScanning(false);
+    e.target.value = '';
   }, [scanInputFiles, onFilesScanned]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -121,8 +172,7 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
         onDrop={handleDrop}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
-        onClick={() => inputRef.current?.click()}
-        className="relative overflow-hidden border-2 border-dashed rounded-2xl p-16 text-center cursor-pointer transition-all duration-300"
+        className="relative overflow-hidden border-2 border-dashed rounded-2xl p-16 text-center transition-all duration-300"
         style={{
           backgroundColor: isDragging ? 'rgba(1,31,91,0.03)' : 'rgba(249,250,251,0.8)',
           borderColor: isDragging ? '#011F5B' : '#d1d5db',
@@ -150,10 +200,23 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
             </div>
             <div>
               <p className="text-xl font-medium text-gray-800">
-                {isDragging ? 'Release to upload' : 'Drop your patient data folder here'}
+                {isDragging ? 'Release to add files' : 'Drop your patient data folder here'}
               </p>
               <p className="mt-1.5 text-gray-500">
-                or <span className="font-medium underline underline-offset-2 text-[#011F5B]">click to browse</span>
+                or{' '}
+                <span
+                  className="font-medium underline decoration-2 underline-offset-2 text-[#011F5B] cursor-pointer transition-colors hover:text-[#0d3a7a]"
+                  onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }}
+                >
+                  browse folder
+                </span>
+                {' '}·{' '}
+                <span
+                  className="font-medium underline decoration-2 underline-offset-2 text-[#011F5B] cursor-pointer transition-colors hover:text-[#0d3a7a]"
+                  onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                >
+                  select files
+                </span>
               </p>
             </div>
             <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
@@ -180,13 +243,21 @@ export default function FileDropZone({ onFilesScanned }: FileDropZoneProps) {
         )}
       </div>
 
-      {/* Hidden file input with webkitdirectory for folder selection */}
+      {/* Folder picker */}
       <input
         ref={inputRef}
         type="file"
         className="hidden"
         onChange={handleInputChange}
-        {...({ webkitdirectory: '', directory: '' } as any)}
+        {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+      />
+      {/* Individual file picker (for single files or mixed selections) */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        className="hidden"
+        onChange={handleFileInputChange}
+        multiple
       />
     </div>
   );

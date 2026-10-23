@@ -27,15 +27,31 @@ import {
   getEffectiveSession,
   getEffectiveModality,
   getEffectiveSubjectGroup,
+  defaultTask,
+  sanitizeTaskLabel,
 } from '../../types/detection';
+import type { DatasetStructure } from '../../types/sessionStructure';
+
+/**
+ * Root of the derivatives tree, for data the scanner computed rather than
+ * acquired (diffusion ADC / FA / trace-weighted maps). The pipeline name
+ * is "scanner" because these arrive already derived from the console --
+ * no processing this tool or the user ran produced them.
+ */
+const DERIVATIVES_ROOT = 'derivatives/scanner';
+
+/** True for any path this tool actually writes into the export. */
+export function isExportedPath(bidsPath: string): boolean {
+  return bidsPath.startsWith('primary/') || bidsPath.startsWith(`${DERIVATIVES_ROOT}/`);
+}
 
 /** Path marker for localizer / scout scans, which are never exported. */
 export const LOCALIZER_EXCLUDED = '(excluded from export: localizer/scout)';
 
 /** Modalities that produce a real data file in the BIDS export. */
 const EXPORTABLE_MODALITIES = new Set<Modality>([
-  'anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-angio',
-  'ct', 'dwi', 'perf', 'eeg', 'ieeg', 'func', 'fmap',
+  'anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-PDw', 'anat-T2starw', 'anat-angio',
+  'ct', 'pet', 'dwi', 'perf', 'eeg', 'ieeg', 'func', 'fmap',
   'electrodes', 'channels', 'events',
 ]);
 
@@ -44,8 +60,11 @@ const SUFFIX: Record<string, string> = {
   'anat-T1w': 'T1w',
   'anat-T2w': 'T2w',
   'anat-FLAIR': 'FLAIR',
+  'anat-PDw': 'PDw',
+  'anat-T2starw': 'T2starw',
   'anat-angio': 'angio',
   'ct': 'ct',
+  'pet': 'pet',
   'dwi': 'dwi',
   'perf': 'asl',
   'eeg': 'eeg',
@@ -56,23 +75,59 @@ const SUFFIX: Record<string, string> = {
   'events': 'events',
 };
 
-/** The BIDS task entity used by recording and functional modalities. */
-function taskEntity(modality: Modality): string | null {
-  if (modality === 'func') return 'task-rest';
-  if (modality === 'eeg' || modality === 'ieeg') return 'task-monitor';
-  if (modality === 'channels' || modality === 'events') return 'task-monitor';
-  return null;
+/**
+ * The task label of every file whose name carries one. Functional MRI and
+ * EEG / iEEG recordings use the label the user set, or the default (rest,
+ * monitor). A channels or events table uses its own label if set;
+ * otherwise it follows the recordings in its source folder, then in its
+ * subject + session, when they all share one task, and falls back to the
+ * default.
+ */
+function assignTasks(results: DetectionResult[]): Map<number, string> {
+  const taskOf = new Map<number, string>();
+  const own = (r: DetectionResult) => sanitizeTaskLabel(r.userTask ?? '');
+  const recordingTasks = new Map<string, Set<string>>();
+  const note = (key: string, task: string) => {
+    const set = recordingTasks.get(key) ?? new Set<string>();
+    set.add(task);
+    recordingTasks.set(key, set);
+  };
+  const folder = (r: DetectionResult) => r.relativePath.slice(0, r.relativePath.lastIndexOf('/') + 1);
+  results.forEach((r, i) => {
+    const m = getEffectiveModality(r);
+    if (m !== 'func' && m !== 'eeg' && m !== 'ieeg') return;
+    const task = own(r) || defaultTask(m)!;
+    taskOf.set(i, task);
+    if (m === 'func') return;
+    note(`dir:${getEffectiveSubjectGroup(r)}|${folder(r)}`, task);
+    note(`ses:${getEffectiveSubjectGroup(r)}|${getEffectiveSession(r) ?? ''}`, task);
+  });
+  results.forEach((r, i) => {
+    const m = getEffectiveModality(r);
+    if (m !== 'channels' && m !== 'events') return;
+    let task = own(r);
+    if (!task) {
+      for (const key of [`dir:${getEffectiveSubjectGroup(r)}|${folder(r)}`, `ses:${getEffectiveSubjectGroup(r)}|${getEffectiveSession(r) ?? ''}`]) {
+        const set = recordingTasks.get(key);
+        if (set?.size === 1) { task = [...set][0]; break; }
+      }
+    }
+    taskOf.set(i, task || defaultTask(m)!);
+  });
+  return taskOf;
 }
 
 /**
  * The export extension for a file. Uncompressed NIfTI (.nii) becomes
- * .nii.gz because the exporter gzips it. Everything else keeps its
- * original extension.
+ * .nii.gz because the exporter gzips it, and a .csv table becomes .tsv
+ * because the exporter converts it. Everything else keeps its original
+ * extension.
  */
 function exportExtension(fileName: string): string {
   const lower = fileName.toLowerCase();
   if (lower.endsWith('.nii.gz')) return '.nii.gz';
   if (lower.endsWith('.nii')) return '.nii.gz';
+  if (lower.endsWith('.csv')) return '.tsv';
   const dot = fileName.lastIndexOf('.');
   return dot >= 0 ? fileName.substring(dot) : '';
 }
@@ -90,12 +145,52 @@ function baseName(fileName: string): string {
   return dot >= 0 ? fileName.substring(0, dot) : fileName;
 }
 
+/** The folder part of a relative path ("" at the top level). */
+function folderOf(relativePath: string): string {
+  const slash = relativePath.lastIndexOf('/');
+  return slash === -1 ? '' : relativePath.slice(0, slash);
+}
+
+/**
+ * Same folder and same base name: how a sidecar or gradient table belongs
+ * to its image (dcm2niix writes them side by side). Matching the base
+ * name alone would pair files across sessions or subjects that happen to
+ * share names, e.g. two patients' rest_bold.json.
+ */
+function sameAcquisitionFiles(a: DetectionResult, b: DetectionResult): boolean {
+  return folderOf(a.relativePath) === folderOf(b.relativePath) && baseName(a.fileName) === baseName(b.fileName);
+}
+
 /** Strip a data-file extension from an already-built BIDS filename. */
 function stripExtension(name: string): string {
   const lower = name.toLowerCase();
   if (lower.endsWith('.nii.gz')) return name.slice(0, -7);
   const dot = name.lastIndexOf('.');
   return dot >= 0 ? name.substring(0, dot) : name;
+}
+
+/**
+ * True for a Siemens motion-corrected series. Detected from the file name
+ * because the distinction is a property of the individual file, not of its
+ * modality: the MoCo volume and the BOLD run it was derived from share a
+ * subject, session and modality, and only the name separates them.
+ */
+function isMotionCorrected(fileName: string): boolean {
+  return /\bmoco/i.test(baseName(fileName).replace(/[_-]/g, ''));
+}
+
+/**
+ * True for a single-band reference image. Multiband sequences acquire an
+ * SBRef calibration volume alongside the real acquisition; Siemens and the
+ * CMRR sequences name it with an "SBRef" suffix.
+ *
+ * It is not itself a diffusion or functional run, so it takes its own
+ * "sbref" suffix rather than being numbered as another _dwi acquisition.
+ * Detected from the file name because, like the motion-corrected case
+ * above, it is a property of the individual file and not of its modality.
+ */
+function isSingleBandReference(fileName: string): boolean {
+  return /sb[-_]?ref/i.test(baseName(fileName));
 }
 
 /** Add the sub- prefix if the id does not already carry it. */
@@ -121,8 +216,13 @@ function classifyFmap(fileName: string): { type: 'magnitude' | 'phase'; echo: nu
   const stem = baseName(fileName).toLowerCase();
   const echoMatch = stem.match(/_e(\d+)/);
   const echo = echoMatch ? parseInt(echoMatch[1], 10) : null;
+  // "_ph" may carry dcm2niix's collision-suffix letter ("_pha"), so allow
+  // one trailing letter before the boundary. Without it, "…_e2_pha" failed
+  // every phase test and was filed as a second magnitude image, which then
+  // collided with the real magnitude2 and split one field-map set across
+  // two run entities (seen in 01_1265, found 2026-08-17).
   const isPhase =
-    /_ph(?:[._]|$)/.test(stem) || /phase/.test(stem) || /phasediff/.test(stem);
+    /_ph[a-z]?(?:[._]|$)/.test(stem) || /phase/.test(stem) || /phasediff/.test(stem);
   return { type: isPhase ? 'phase' : 'magnitude', echo };
 }
 
@@ -130,7 +230,164 @@ function byEcho(a: FmapAcquisition, b: FmapAcquisition): number {
   return (a.echo ?? 99) - (b.echo ?? 99) || a.base.localeCompare(b.base);
 }
 
+// ── Diffusion gradient-table pairing ─────────────────────────────
+// A .bval/.bvec describes one diffusion acquisition and must travel with
+// it. bidsNaming pairs companions by shared base name, which works when
+// dcm2niix named them together -- but some sites name gradients
+// independently of the images:
+//
+//   DTI_b1000.bval                        (gradient table)
+//   ep2d_diff_sms_aldit_b1k.nii.gz        (the acquisition it describes)
+//
+// Those share no base name, so each became its own acquisition with its
+// own run entity: "run-1_dwi.bval" describing no exported image, and
+// "run-13_dwi.nii.gz" shipping with no gradients (found 2026-08-17).
+//
+// Pairing is by the only thing that actually identifies the acquisition a
+// gradient table belongs to: its b-value and phase-encoding direction. A
+// .bval file exists to describe a specific b-value acquisition, so this is
+// a semantic match, not a coincidence of naming.
+//
+// The rule is deliberately strict -- pair ONLY when exactly one candidate
+// raw diffusion image in the same session matches. Zero candidates or two
+// or more means no pairing, and lib/validation/bidsValidator.ts already
+// warns about the leftovers. A wrong pairing would attach the wrong
+// gradient directions to a series and yield plausible-looking tractography
+// from the wrong table, which is far worse than an unpaired file.
+// Measured over the Phase2_MRI corpus: 99 pair cleanly, 16 ambiguous, 28
+// with no candidate image.
+
+/** True for a diffusion gradient table. */
+function isGradientTable(fileName: string): boolean {
+  return /\.(bval|bvec)$/i.test(fileName);
+}
+
+/**
+ * The acquisition a gradient table or diffusion image belongs to,
+ * expressed as "<b-value in s/mm2>|<phase-encoding reversed>".
+ *
+ * Handles both notations this data uses for the same value: "b1k" and
+ * "b1000" both mean 1000 s/mm^2. Reversal is marked variously as PErev,
+ * revPE or a bare _rev suffix.
+ */
+function diffusionAcquisitionKey(fileName: string): string | null {
+  const n = baseName(fileName).toLowerCase();
+  const reversed = /perev|revpe|_rev\b|_rev[a-z]?$/.test(n);
+
+  let m = n.match(/b(\d+)k\b/) ?? n.match(/_b(\d+)k/);
+  if (m) return `${Number(m[1]) * 1000}|${reversed}`;
+  m = n.match(/\bb[_-]?(\d{3,4})\b/) ?? n.match(/_b(\d{3,4})/);
+  if (m) return `${Number(m[1])}|${reversed}`;
+  m = n.match(/\b(\d+)k\b/);
+  if (m) return `${Number(m[1]) * 1000}|${reversed}`;
+  return null;
+}
+
+/**
+ * True when a gradient table shares its base name with a diffusion image
+ * that will be exported -- dcm2niix's normal output, where the existing
+ * base-name grouping already keeps them together and no b-value matching
+ * is needed.
+ */
+function gradientMatchesByBaseName(results: DetectionResult[], grad: DetectionResult): boolean {
+  return results.some(r =>
+    r !== grad &&
+    /\.nii(\.gz)?$/i.test(r.fileName) &&
+    sameAcquisitionFiles(r, grad) &&
+    !r.duplicateOf,
+  );
+}
+
+/**
+ * Resolve each unpaired gradient table to the index of the raw diffusion
+ * image it describes. Returns only unambiguous matches.
+ */
+function pairGradientTables(results: DetectionResult[]): Map<number, number> {
+  const pairing = new Map<number, number>();
+
+  // Candidate images: raw diffusion that will actually be exported --
+  // never a derived map (an ADC map has no gradient table) and never the
+  // redundant copy of a duplicated series.
+  const candidates = results
+    .map((r, i) => ({ r, i }))
+    .filter(({ r }) =>
+      /\.nii(\.gz)?$/i.test(r.fileName) &&
+      getEffectiveModality(r) === 'dwi' &&
+      !r.derivedLabel &&
+      !r.duplicateOf,
+    );
+
+  results.forEach((g, gi) => {
+    if (!isGradientTable(g.fileName)) return;
+    // Already paired the normal way: same base name as an image.
+    if (candidates.some(({ r }) => sameAcquisitionFiles(r, g))) return;
+
+    const key = diffusionAcquisitionKey(g.fileName);
+    if (!key) return;
+
+    const session = getEffectiveSession(g);
+    const group = getEffectiveSubjectGroup(g);
+    const hits = candidates.filter(({ r }) =>
+      getEffectiveSubjectGroup(r) === group &&
+      getEffectiveSession(r) === session &&
+      diffusionAcquisitionKey(r.fileName) === key,
+    );
+    if (hits.length === 1) pairing.set(gi, hits[0].i);
+  });
+
+  return pairing;
+}
+
+// ── Magnitude / phase pairing (complex-valued acquisitions) ──────
+// An SWI or T2*-GRE sequence reconstructs both a magnitude and a phase
+// image from the same acquisition. They are one acquisition in two parts,
+// not two acquisitions, so BIDS separates them with the part- entity
+// rather than numbering them run-1 and run-2 as this module used to.
+//
+// Two namings appear in the Phase2_MRI corpus, both handled:
+//
+//   Sag_SWI_3D.nii.gz + Sag_SWI_3D_ph.nii.gz    same base, _ph marks phase
+//   Mag_Images.nii.gz + Pha_Images_ph.nii.gz    Siemens' separate SWI
+//                                               reconstruction outputs
+//
+// part- is assigned only when BOTH members are present in the same
+// subject + session + modality group. A lone magnitude is just an
+// acquisition and takes no part- entity, because part- asserts the
+// existence of a counterpart.
+//
+// Field maps are excluded: they have their own magnitude1 / magnitude2 /
+// phasediff scheme (see assignFmapEntities) and must not gain part- on top.
+
+/** True for the phase member of a complex pair. */
+function isPhaseImage(fileName: string): boolean {
+  const stem = baseName(fileName).toLowerCase();
+  return /_ph(?:[._]|$)/.test(stem) || /_ph[a-z]?$/.test(stem) || /\bpha[-_]?images\b/.test(stem);
+}
+
+/**
+ * The acquisition two complex parts share, so magnitude and phase collapse
+ * to one identity. Returns the base name unchanged for anything that is
+ * not part of a pair.
+ */
+function complexAcquisitionIdentity(fileName: string): string {
+  const stem = baseName(fileName);
+  // Siemens' separately-named SWI reconstruction outputs.
+  if (/^(mag|pha)[-_]?images/i.test(stem)) return 'swi-recon';
+  // Same-base pair: strip the _ph marker (and any dcm2niix collision
+  // letter after it) so the phase image lands on its magnitude's identity.
+  return stem.replace(/_ph([a-z]?)$/i, (_m, letter) => (letter ? letter : ''));
+}
+
 // ── Entity assignment ─────────────────────────────────────────────
+
+/**
+ * PET images with different tracers are different acquisitions with
+ * different trc- names, so they're numbered separately: an FDG and an
+ * amyloid scan in one session must not become run-1 / run-2.
+ */
+function petTracerKey(r: DetectionResult, modality: Modality): string {
+  return modality === 'pet' ? ` trc:${r.pet?.tracer ?? ''}` : '';
+}
 
 /**
  * Assign run / field-map suffix entities to one subject + session +
@@ -141,9 +398,17 @@ function assignGroupEntities(
   results: DetectionResult[],
   indices: number[],
   runOf: Map<number, number>,
-  fmapSuffixOf: Map<number, string>,
+  // part-mag / part-phase for complex-valued acquisitions.
+  partOf: Map<number, string>,
+  // Per-file BIDS suffix override. Field maps use it for
+  // magnitude1/magnitude2/phasediff, and single-band reference images for
+  // "sbref"; anything not listed falls back to SUFFIX[modality].
+  suffixOf: Map<number, string>,
+  // PET rec- label (acstat / nacdyn / ...), see petReconstructionLabels().
+  recOf: Map<number, string>,
 ): void {
   const modality = getEffectiveModality(results[indices[0]]);
+  if (modality === 'pet') petReconstructionLabels(results, indices, recOf);
 
   // distinct acquisitions, keyed by base name, in a stable order
   const baseToIndices = new Map<string, number[]>();
@@ -156,16 +421,97 @@ function assignGroupEntities(
   const bases = [...baseToIndices.keys()].sort();
 
   if (modality === 'fmap') {
-    assignFmapEntities(results, baseToIndices, bases, runOf, fmapSuffixOf);
+    assignFmapEntities(results, baseToIndices, bases, runOf, suffixOf);
     return;
   }
 
   // Every other modality: number the acquisitions when there is more
   // than one. A single acquisition needs no run entity.
-  if (bases.length > 1) {
-    bases.forEach((b, idx) => {
-      for (const i of baseToIndices.get(b)!) runOf.set(i, idx + 1);
-    });
+  //
+  // Numbering happens WITHIN a reconstruction group, because rec- already
+  // separates a reconstruction from its source acquisition. A session
+  // holding one BOLD run plus its Siemens MoCoSeries has two bases, so
+  // flat numbering produced "task-rest_bold" as run-1 and
+  // "task-rest_rec-moco_bold" as run-2 -- a redundant run entity implying
+  // two separate runs when there is one acquisition and one
+  // reconstruction of it. Split first, then number, so each side gets a
+  // run entity only if it genuinely repeats.
+  // Single-band reference images are grouped separately for the same
+  // reason: an SBRef is a calibration volume for an acquisition, not a
+  // repeat of it. Pooling them with the real runs numbered a diffusion
+  // series and its own reference as run-1/run-2, which reads as two
+  // diffusion acquisitions. They also take the "sbref" suffix instead of
+  // the modality's, so what they are is visible in the name.
+  // Collapse magnitude/phase pairs to one identity first, so a complex
+  // acquisition is numbered once and its two parts differ only by part-.
+  // Without this the pair came out run-1 / run-2, asserting two separate
+  // acquisitions of the same thing.
+  const identityToBases = new Map<string, string[]>();
+  for (const b of bases) {
+    const sample = results[baseToIndices.get(b)![0]];
+    const id = complexAcquisitionIdentity(sample.fileName);
+    const list = identityToBases.get(id);
+    if (list) list.push(b);
+    else identityToBases.set(id, [b]);
+  }
+
+  for (const [, idBases] of identityToBases) {
+    if (idBases.length < 2) continue;
+    const phases = idBases.filter(b => isPhaseImage(results[baseToIndices.get(b)![0]].fileName));
+    const mags = idBases.filter(b => !isPhaseImage(results[baseToIndices.get(b)![0]].fileName));
+    // part- asserts a counterpart exists, so only label a real pair.
+    if (phases.length === 0 || mags.length === 0) continue;
+    for (const b of mags) for (const i of baseToIndices.get(b)!) partOf.set(i, 'mag');
+    for (const b of phases) for (const i of baseToIndices.get(b)!) partOf.set(i, 'phase');
+  }
+
+  const recGroups = new Map<string, string[]>();
+  for (const id of [...identityToBases.keys()].sort()) {
+    const sample = results[baseToIndices.get(identityToBases.get(id)![0])![0]];
+    const sbref = isSingleBandReference(sample.fileName);
+    if (sbref) {
+      for (const b of identityToBases.get(id)!) {
+        for (const i of baseToIndices.get(b)!) suffixOf.set(i, 'sbref');
+      }
+    }
+    const key = `${isMotionCorrected(sample.fileName) ? 'rec-moco' : ''}|${sbref ? 'sbref' : ''}|${recOf.get(baseToIndices.get(identityToBases.get(id)![0])![0]) ?? ''}`;
+    const list = recGroups.get(key);
+    if (list) list.push(id);
+    else recGroups.set(key, [id]);
+  }
+
+  // Number identities, not files: a complex pair shares one run entity.
+  for (const groupIds of recGroups.values()) {
+    if (groupIds.length > 1) {
+      groupIds.forEach((id, idx) => {
+        for (const b of identityToBases.get(id)!) {
+          for (const i of baseToIndices.get(b)!) runOf.set(i, idx + 1);
+        }
+      });
+    }
+  }
+}
+
+/**
+ * BIDS rec- labels for one subject + session + tracer group of PET
+ * images. Set only when the group holds both attenuation-corrected and
+ * non-corrected reconstructions (names containing "NAC" / "noAC"), since
+ * that is when two images of one acquisition would otherwise collide.
+ * Uses the BIDS reserved values: ac/nac + dyn/stat (dynamic when the
+ * sidecar lists more than one frame). If framing is unknown the label is
+ * just ac / nac. A group with no NAC image gets no rec- at all; repeated
+ * scans there are numbered with run- like any other modality.
+ */
+function petReconstructionLabels(results: DetectionResult[], indices: number[], recOf: Map<number, string>): void {
+  const states = indices.map(i => results[i].pet?.attenuationCorrected ?? null);
+  const hasNac = states.includes(false);
+  const hasAc = states.some(s => s !== false);
+  if (!hasNac || !hasAc) return;
+  for (const i of indices) {
+    const pet = results[i].pet;
+    const correction = pet?.attenuationCorrected === false ? 'nac' : 'ac';
+    const framing = pet?.dynamic === true ? 'dyn' : pet?.dynamic === false ? 'stat' : '';
+    recOf.set(i, `${correction}${framing}`);
   }
 }
 
@@ -193,15 +539,76 @@ function assignFmapEntities(
   mags.sort(byEcho);
   phases.sort(byEcho);
 
+  // Suffixes are assigned per ACQUISITION SERIES, not across the whole
+  // subject+session field-map group.
+  //
+  // A Siemens gradient-echo field map is one series emitting three files
+  // (_e1, _e2, _e2_ph) that together form a valid BIDS set: magnitude1 +
+  // magnitude2 + phasediff. A session routinely holds more than one such
+  // series -- "gre_field_mapping" and "gre_field_mappingRS" (a
+  // resting-state-specific map) both appear in the Phase2_MRI corpus.
+  //
+  // Pooling every phase image in the session made phases.length 2, which
+  // took the phase1/phase2 branch, and since both phase files carry echo
+  // 2 both were named "phase2" and separated only by a run- entity. The
+  // result was magnitude1 + magnitude2 + phase2 per series, which is not
+  // one of the two combinations BIDS accepts for a field map (either
+  // phasediff with magnitude1[+magnitude2], or phase1 + phase2 with both
+  // magnitudes). Splitting by series restores phasediff.
+  //
+  // This path had no coverage before: the field-map regex never matched
+  // "gre_field_mapping", so no real field map ever reached this function
+  // and the demo dataset contains none. Surfaced 2026-08-17 once the
+  // regex was fixed.
+  // Series identity = the acquisition name with the echo / phase token
+  // removed, but KEEPING dcm2niix's collision-suffix letter.
+  //
+  // When dcm2niix would emit the same name twice it appends a letter, so a
+  // second complete field-map set arrives as _e1a / _e2a / _e2_pha
+  // alongside _e1 / _e2 / _e2_ph. Those are two full sets, not extra
+  // echoes of one set, so the letter belongs to the series key.
+  //
+  // Getting this wrong split 01_1265's field maps into per-file "series"
+  // and produced magnitude-only and phasediff-only groups: the first
+  // version of this regex was /_e\d+(_ph)?$/ and did not match "_e1a" or
+  // "_e2_pha" at all, leaving the echo token in the stem.
+  const seriesOf = (base: string): string => {
+    const m = base.match(/^(.*)_e(\d+)([a-z]?)(?:_ph([a-z]?))?$/i);
+    if (!m) return base.replace(/_ph[a-z]?$/i, '');
+    const [, stem, , echoVariant, phaseVariant] = m;
+    const variant = echoVariant || phaseVariant || '';
+    return variant ? `${stem}#${variant}` : stem;
+  };
+
+  const seriesNames = [...new Set(bases.map(seriesOf))].sort();
+
   const suffixForBase = new Map<string, string>();
-  mags.forEach((m, idx) => {
-    suffixForBase.set(m.base, `magnitude${m.echo ?? idx + 1}`);
-  });
-  if (phases.length === 1) {
-    suffixForBase.set(phases[0].base, 'phasediff');
-  } else {
-    phases.forEach((p, idx) => {
-      suffixForBase.set(p.base, `phase${p.echo ?? idx + 1}`);
+  for (const series of seriesNames) {
+    const seriesMags = mags.filter(m => seriesOf(m.base) === series);
+    const seriesPhases = phases.filter(p => seriesOf(p.base) === series);
+
+    seriesMags.forEach((m, idx) => {
+      suffixForBase.set(m.base, `magnitude${m.echo ?? idx + 1}`);
+    });
+    if (seriesPhases.length === 1) {
+      suffixForBase.set(seriesPhases[0].base, 'phasediff');
+    } else {
+      seriesPhases.forEach((p, idx) => {
+        suffixForBase.set(p.base, `phase${p.echo ?? idx + 1}`);
+      });
+    }
+  }
+
+  // Two distinct series in one session would otherwise collide on
+  // identical suffixes; give each series its own run- so the sets stay
+  // separable. The collision pass below handles any residue.
+  if (seriesNames.length > 1) {
+    seriesNames.forEach((series, idx) => {
+      for (const b of bases) {
+        if (seriesOf(b) === series) {
+          for (const i of baseToIndices.get(b)!) runOf.set(i, idx + 1);
+        }
+      }
     });
   }
 
@@ -234,19 +641,49 @@ function assignFmapEntities(
 /**
  * Build a BIDS filename from its parts. Entity order follows the BIDS
  * spec: sub, ses, task, run, suffix.
+ *
+ * session is nullable for the Single session preset (Phase 2, August
+ * 2026): per the actual BIDS spec, the session level is optional, and a
+ * dataset with only one timepoint per subject conventionally omits ses-
+ * entirely rather than inventing a meaningless placeholder session id.
+ * When null, the ses- entity is simply left out of both the filename and
+ * the folder path below.
  */
 function buildFilename(
   sub: string,
-  session: Session,
+  session: Session | null,
   modality: Modality,
   originalFileName: string,
   run: number | undefined,
   fmapSuffix: string | undefined,
+  derivedLabel?: string,
+  part?: string,
+  // PET only: trc-<tracer> and rec-<reconstruction>, in BIDS entity
+  // order (after task, before run).
+  tracer?: string | null,
+  rec?: string,
+  task?: string,
 ): string {
-  const parts: string[] = [sub, session];
-  const task = taskEntity(modality);
-  if (task) parts.push(task);
+  const parts: string[] = session ? [sub, session] : [sub];
+  if (task) parts.push(`task-${task}`);
+  if (modality === 'pet' && tracer) parts.push(`trc-${tracer}`);
+  if (rec) parts.push(`rec-${rec}`);
+  // BIDS rec-<label> marks a reconstruction of an acquisition. Siemens
+  // emits MoCoSeries as the motion-corrected version of a BOLD run, so it
+  // is the same acquisition reconstructed differently -- not a second run.
+  // Without this the MoCo volume and the run it came from both resolve to
+  // "task-rest_bold" and are separated only by run-1 / run-2, which loses
+  // the relationship and implies two independent acquisitions.
+  if (isMotionCorrected(originalFileName)) parts.push('rec-moco');
   if (run !== undefined) parts.push(`run-${run}`);
+  // desc- names which scanner-computed map this is (ADC / FA / TRACEW),
+  // so the derivatives tree distinguishes them without inventing a
+  // modality for each.
+  if (derivedLabel) parts.push(`desc-${derivedLabel}`);
+  // part- distinguishes the magnitude and phase halves of one
+  // complex-valued acquisition. Placed after desc- and immediately before
+  // the suffix, matching BIDS entity order.
+  if (part) parts.push(`part-${part}`);
 
   const suffix = fmapSuffix ?? SUFFIX[modality] ?? modality;
 
@@ -266,7 +703,7 @@ function findSidecarPartner(
   results: DetectionResult[],
   sidecarIndex: number,
 ): DetectionResult | null {
-  const base = baseName(results[sidecarIndex].fileName);
+  const sidecar = results[sidecarIndex];
   // We accept partners whose own path is excluded (for example a
   // localizer). The caller checks the partner's path before deciding
   // whether to mirror it; either way the sidecar inherits the
@@ -276,7 +713,7 @@ function findSidecarPartner(
     if (di === sidecarIndex) return false;
     const m = getEffectiveModality(d);
     if (m === 'sidecar-json' || m === 'sidecar-tsv') return false;
-    return baseName(d.fileName) === base;
+    return sameAcquisitionFiles(d, sidecar);
   });
   if (candidates.length === 0) return null;
 
@@ -297,11 +734,15 @@ function findSidecarPartner(
  */
 function dedupePaths(results: DetectionResult[]): void {
   const counts = new Map<string, number>();
+  const firstHolder = new Map<string, string>();
   for (const r of results) {
-    if (!r.bidsPath.startsWith('primary/')) continue;
+    r.nameCollisionWith = undefined;
+    if (!isExportedPath(r.bidsPath)) continue;
     const n = counts.get(r.bidsPath) ?? 0;
     counts.set(r.bidsPath, n + 1);
+    if (n === 0) firstHolder.set(r.bidsPath, r.relativePath);
     if (n > 0) {
+      r.nameCollisionWith = firstHolder.get(r.bidsPath);
       const slash = r.bidsPath.lastIndexOf('/');
       const dir = r.bidsPath.slice(0, slash + 1);
       const file = r.bidsPath.slice(slash + 1);
@@ -330,27 +771,104 @@ function dedupePaths(results: DetectionResult[]): void {
 export function computeBidsNames(
   results: DetectionResult[],
   subjectIdMap?: Map<string, string>,
+  structure?: DatasetStructure,
 ): DetectionResult[] {
   const out = results.map(r => ({ ...r }));
+  const sessionless = structure?.presetId === 'single-session';
+
+  // Gradient tables whose name does not match any image are resolved to
+  // their acquisition by b-value + phase-encoding direction. Computed
+  // before grouping so a paired table neither takes a run number of its
+  // own nor is treated as a separate acquisition.
+  const gradientPairing = pairGradientTables(out);
 
   // ── Group exportable data files by subject + session + modality ──
+  // For a sessionless (Single session preset) dataset there's no session
+  // component to the key -- acquisitions are still grouped and numbered
+  // (run-1, run-2, ...) by subject + modality alone, same as any other
+  // preset, just without a session dimension.
+  // Runs are numbered per task: task-rest and task-motor BOLD in one
+  // session are each run-1, not run-1 and run-2.
+  const taskOf = assignTasks(out);
   const groups = new Map<string, number[]>();
   out.forEach((r, i) => {
     const modality = getEffectiveModality(r);
     const session = getEffectiveSession(r);
-    if (!session) return;
+    if (!session && !sessionless) return;
     if (!EXPORTABLE_MODALITIES.has(modality)) return;
-    const key = `${getEffectiveSubjectGroup(r)} ${session} ${modality}`;
+    // Files that will be routed to unclassified/ below must not take part
+    // in run numbering, or they consume run numbers they never use and
+    // the exported series come out as run-1, run-3, run-5 with gaps that
+    // look like missing acquisitions. Mirrors the two exclusion checks in
+    // the naming pass further down; userModality overrides both there, so
+    // it overrides here too.
+    if (r.modalityIsGuess && !r.userModality) return;
+    if (r.duplicateOf && !r.userModality) return;
+    // A paired gradient table inherits its image's name below, so it must
+    // not be numbered as an acquisition in its own right.
+    if (gradientPairing.has(i)) return;
+    // An UNpaired one is excluded outright. Numbering it as its own
+    // acquisition produced "run-3_dwi.bval" sitting in the dataset beside
+    // no "run-3_dwi.nii.gz" -- a gradient table asserting it belongs to an
+    // image that was never exported. Anyone reading the output would pair
+    // them by the run entity and get a table for the wrong series, or one
+    // with no series at all. Left unclassified and reported by
+    // lib/validation/bidsValidator.ts instead.
+    if (isGradientTable(r.fileName) && !gradientMatchesByBaseName(out, r)) return;
+    // Scanner-derived maps are numbered inside their own derivatives
+    // group, keyed by which map they are, so an ADC map never takes a run
+    // number away from the raw diffusion series it was computed from.
+    const key = r.derivedLabel
+      ? (sessionless
+          ? `${getEffectiveSubjectGroup(r)} ${modality} derived:${r.derivedLabel}`
+          : `${getEffectiveSubjectGroup(r)} ${session} ${modality} derived:${r.derivedLabel}`)
+      : (sessionless
+        ? `${getEffectiveSubjectGroup(r)} ${modality}${petTracerKey(r, modality)}`
+        : `${getEffectiveSubjectGroup(r)} ${session} ${modality}${petTracerKey(r, modality)}`)
+        + (taskOf.has(i) ? ` task:${taskOf.get(i)}` : '');
     const list = groups.get(key);
     if (list) list.push(i);
     else groups.set(key, [i]);
   });
 
   const runOf = new Map<number, number>();
+  const partOf = new Map<number, string>();
   const fmapSuffixOf = new Map<number, string>();
+  const recOf = new Map<number, string>();
   for (const indices of groups.values()) {
-    assignGroupEntities(out, indices, runOf, fmapSuffixOf);
+    assignGroupEntities(out, indices, runOf, partOf, fmapSuffixOf, recOf);
   }
+
+  // ── Which recording each electrodes/channels/events table belongs to ──
+  // BIDS keeps these tables next to their recording: eeg/ for scalp EEG,
+  // ieeg/ for intracranial. They were always written to ieeg/, so a scalp
+  // EEG session's channels.tsv landed in an ieeg/ folder with no iEEG
+  // recording in it. A table follows an EEG/iEEG recording in its own
+  // source folder first, then in its subject + session; with no scalp EEG
+  // (or with both kinds and nothing closer), it stays in ieeg/.
+  const recordingsIn = new Map<string, Set<Modality>>();
+  const noteRecording = (key: string, m: Modality) => {
+    const set = recordingsIn.get(key);
+    if (set) set.add(m);
+    else recordingsIn.set(key, new Set([m]));
+  };
+  for (const r of out) {
+    const m = getEffectiveModality(r);
+    if (m !== 'eeg' && m !== 'ieeg') continue;
+    noteRecording(`dir:${getEffectiveSubjectGroup(r)}|${r.relativePath.slice(0, r.relativePath.lastIndexOf('/') + 1)}`, m);
+    noteRecording(`ses:${getEffectiveSubjectGroup(r)}|${getEffectiveSession(r) ?? ''}`, m);
+  }
+  const tableFolder = (r: DetectionResult): string => {
+    const group = getEffectiveSubjectGroup(r);
+    for (const key of [
+      `dir:${group}|${r.relativePath.slice(0, r.relativePath.lastIndexOf('/') + 1)}`,
+      `ses:${group}|${getEffectiveSession(r) ?? ''}`,
+    ]) {
+      const kinds = recordingsIn.get(key);
+      if (kinds?.size === 1) return kinds.has('eeg') ? 'eeg' : 'ieeg';
+    }
+    return 'ieeg';
+  };
 
   // ── Name the data files ──────────────────────────────────────────
   out.forEach((r, i) => {
@@ -366,7 +884,42 @@ export function computeBidsNames(
     if (modality === 'sidecar-json' || modality === 'sidecar-tsv') {
       return; // paired in the next pass
     }
-    if (!session || !EXPORTABLE_MODALITIES.has(modality)) {
+    // A modality that came only from the blind "Defaulting ambiguous NIfTI
+    // to T1w -- please verify" fallback must not be written under a
+    // modality-specific BIDS name. Until this check existed, such a file
+    // passed both real export gates (it has a session, and anat-T1w is
+    // exportable) and was written as sub-XX_ses-YY_run-N_T1w.nii.gz --
+    // 371 field-map, proton-density and diffusion scans in the Phase2_MRI
+    // corpus were exported as fabricated anatomicals (audit 2026-08-17).
+    // Confidence could not be used for this: nothing in the export path
+    // reads it.
+    //
+    // r.userModality is checked directly rather than via
+    // getEffectiveModality so that a user who picks a modality in the
+    // mapping table clears the guess and exports normally. The goal is to
+    // require a human decision, not to drop the file.
+    if (r.modalityIsGuess && !r.userModality) {
+      r.bidsFilename = r.fileName;
+      r.bidsPath = `unclassified/${r.fileName}`;
+      return;
+    }
+    // The redundant copy of a series that was converted twice. Exporting
+    // both would give them separate run- entities and assert two
+    // acquisitions where the scanner produced one, double-counting the
+    // series downstream. The kept copy is the one carrying the .json
+    // sidecar; see DetectionResult.duplicateOf. userModality overrides,
+    // so the user can still force this copy through if they disagree
+    // about which one to keep.
+    if (r.duplicateOf && !r.userModality) {
+      r.bidsFilename = r.fileName;
+      r.bidsPath = `unclassified/${r.fileName}`;
+      return;
+    }
+    // A null session is only a legitimate, exportable state when this
+    // dataset's active preset is Single session (sessionless). For every
+    // other preset it means detection genuinely failed to assign one, so
+    // the file falls to unclassified/ same as before Phase 2.
+    if ((!session && !sessionless) || !EXPORTABLE_MODALITIES.has(modality)) {
       r.bidsFilename = r.fileName;
       r.bidsPath = `unclassified/${r.fileName}`;
       return;
@@ -375,13 +928,53 @@ export function computeBidsNames(
     const sub = subjectPrefix(subjectIdMap?.get(group) ?? group);
     const filename = buildFilename(
       sub, session, modality, r.fileName,
-      runOf.get(i), fmapSuffixOf.get(i),
+      runOf.get(i), fmapSuffixOf.get(i), r.derivedLabel, partOf.get(i),
+      r.pet?.tracer, recOf.get(i), taskOf.get(i),
     );
-    const folder = MODALITIES.find(m => m.value === modality)?.bidsFolder ?? '';
+    const folder = modality === 'electrodes' || modality === 'channels' || modality === 'events'
+      ? tableFolder(r)
+      : MODALITIES.find(m => m.value === modality)?.bidsFolder ?? '';
+    // session is null here exactly when sessionless is true (guarded
+    // above), so the ses- path segment is simply omitted rather than
+    // ever being an empty/undefined string.
+    const sessionSegment = session ? `${session}/` : '';
     r.bidsFilename = filename;
+
+    // Scanner-computed maps go to a derivatives tree that mirrors the raw
+    // layout, rather than into primary/ beside the acquisitions they were
+    // computed from. "scanner" names the producing pipeline, which is the
+    // console itself -- these arrive already derived, not from any
+    // processing this tool or the user ran.
+    const root = r.derivedLabel ? `${DERIVATIVES_ROOT}/` : 'primary/';
     r.bidsPath = folder
-      ? `primary/${sub}/${session}/${folder}/${filename}`
-      : `primary/${sub}/${session}/${filename}`;
+      ? `${root}${sub}/${sessionSegment}${folder}/${filename}`
+      : `${root}${sub}/${sessionSegment}${filename}`;
+  });
+
+  // ── Give paired gradient tables their image's name ───────────────
+  // Mirrors the JSON-sidecar pass below: same stem as the image, own
+  // extension, so a scan and its gradients land side by side.
+  out.forEach((r, i) => {
+    if (!isGradientTable(r.fileName)) return;
+    if (gradientPairing.has(i)) return;
+    if (gradientMatchesByBaseName(out, r)) return;
+    r.bidsFilename = r.fileName;
+    r.bidsPath = `unclassified/${r.fileName}`;
+  });
+
+  gradientPairing.forEach((imageIndex, gradientIndex) => {
+    const g = out[gradientIndex];
+    const image = out[imageIndex];
+    const ext = /\.bval$/i.test(g.fileName) ? '.bval' : '.bvec';
+    if (isExportedPath(image.bidsPath)) {
+      g.bidsFilename = stripExtension(image.bidsFilename) + ext;
+      g.bidsPath = image.bidsPath.replace(/[^/]+$/, g.bidsFilename);
+    } else {
+      // The image itself is not being exported, so its gradients are not
+      // either -- the same rule the sidecar pass applies to a localizer.
+      g.bidsFilename = g.fileName;
+      g.bidsPath = `unclassified/${g.fileName}`;
+    }
   });
 
   // ── Pair sidecars with their data file ───────────────────────────
@@ -392,7 +985,7 @@ export function computeBidsNames(
     const partner = findSidecarPartner(out, i);
     if (partner) {
       const sidecarExt = modality === 'sidecar-json' ? '.json' : '.tsv';
-      if (partner.bidsPath.startsWith('primary/')) {
+      if (isExportedPath(partner.bidsPath)) {
         // Partner has a real export path; mirror it for the sidecar.
         r.bidsFilename = stripExtension(partner.bidsFilename) + sidecarExt;
         r.bidsPath = partner.bidsPath.replace(/[^/]+$/, r.bidsFilename);

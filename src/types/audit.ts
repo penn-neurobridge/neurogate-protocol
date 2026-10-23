@@ -13,12 +13,18 @@
  * with a timestamp, actor, action type, and details.
  */
 
+import { APP_VERSION } from '../version';
+
 // ── Action Categories ─────────────────────────────────────────
 
 export type AuditAction =
+  // Structure setup
+  | 'structure-selected'      // User chose a session-structure preset (Step 1)
+  | 'structure-changed'       // User went back and switched to a different structure (files cleared)
   // File scanning
   | 'files-scanned'           // User dropped files, scanning completed
   | 'session-restored'        // Tool restored a saved session from sessionStorage
+  | 'audit-log-restored'      // The page was reloaded and the log was restored from tab storage
   // Detection
   | 'detection-completed'     // Auto-detection engine finished
   // User corrections in mapping table
@@ -27,22 +33,22 @@ export type AuditAction =
   | 'subject-corrected'       // User changed a file's subject group
   | 'bulk-session-applied'    // User bulk-applied a session
   | 'bulk-modality-applied'   // User bulk-applied a modality
+  | 'task-corrected'          // User changed a file's task label
+  | 'bulk-task-applied'       // User bulk-applied a task label
   // Metadata
   | 'institution-configured'  // User set institution prefix/starting number
   | 'subject-metadata-entered' // User entered session dates/ages for a subject
   | 'dataset-description-entered' // User filled in dataset description
   | 'defacing-attested'       // User confirmed defacing attestation
-  | 'defacing-revoked'        // User unchecked defacing attestation
+  | 'defacing-revoked'        // Attestation unticked, or cleared because the structural MRI files changed
   // Validation
   | 'validation-run'          // Validation engine executed
-  | 'validation-issue-dismissed' // User dismissed a warning/info issue
-  // Upload (future)
-  | 'upload-started'          // Upload process initiated
-  | 'upload-completed'        // Upload finished successfully
-  | 'upload-failed'           // Upload failed
+  | 'validation-issue-dismissed' // User dismissed an issue
+  | 'validation-dismissals-cleared' // Re-run Checks brought dismissed issues back
   // Export
   | 'validation-passed'       // Validation passed, moving to export
   | 'export-completed'        // BIDS dataset exported as ZIP
+  | 'deidentification-summary' // What de-identification actions were taken during export (which fields were stripped/shifted, whether PHI was detected). Deliberately excludes raw date-shift day values -- see logDeidentificationSummary in auditLogger.ts.
   | 'audit-log-exported';     // User exported the audit log itself
 
 // ── Single Audit Entry ────────────────────────────────────────
@@ -71,6 +77,12 @@ export interface AuditLog {
   toolVersion: string;
   /** All entries in chronological order */
   entries: AuditEntry[];
+  /**
+   * The id of the last entry included in a saved copy (an export, or
+   * Export JSON / CSV). Kept with the log so a reload remembers it; not
+   * written into exported files.
+   */
+  savedThroughId?: number;
 }
 
 // ── Export Formats ────────────────────────────────────────────
@@ -90,7 +102,7 @@ export interface AuditExportHeader {
 export function createAuditLog(): AuditLog {
   return {
     sessionStarted: new Date().toISOString(),
-    toolVersion: '1.0.0-alpha',
+    toolVersion: APP_VERSION,
     entries: [],
   };
 }

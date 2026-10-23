@@ -22,21 +22,73 @@ export interface ExtensionResult {
 }
 
 /**
+ * Filenames operating systems and file managers drop into any folder
+ * automatically -- never real scan data, but extremely common in real
+ * folder drops (Thumbs.db in particular is silently created by Windows
+ * Explorer in any folder containing images, so it's essentially
+ * guaranteed to show up in an "anat" folder sooner or later). Checked
+ * first, before any extension-specific logic, so these can never be
+ * mistaken for real data regardless of extension or folder name. Found
+ * via adversarial testing 2026-08-02: a Thumbs.db file dropped in an
+ * "anat" folder was being classified as a high-confidence T1w MRI scan
+ * (see the folder/extension-compatibility fix in engine.ts) and would
+ * have been silently exported as fabricated patient data.
+ */
+const OS_JUNK_FILENAMES = new Set([
+  'thumbs.db', 'ehthumbs.db', 'ehthumbs_vista.db', // Windows
+  '.ds_store', '.spotlight-v100', '.trashes', '.fseventsd', 'icon\r', // macOS
+  'desktop.ini', // Windows folder customization
+  '.directory', // Linux/KDE
+]);
+
+export function isOsJunkFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  if (OS_JUNK_FILENAMES.has(lower)) return true;
+  // Any hidden (dot-prefixed) file. This covers macOS AppleDouble
+  // resource-fork sidecars ("._scan.nii.gz") and, more importantly,
+  // in-flight copy artifacts: rsync writes a partial transfer as
+  // ".<name>.<random>", so an interrupted copy leaves
+  // ".T1_axial.nii.gz.qkjGHi" behind. That name still contains "T1_axial",
+  // so the filename detector classified it as a real T1w and it would have
+  // been exported as an anatomical scan -- fabricated data from a transfer
+  // artifact. Found in the staged corpus 2026-08-17.
+  //
+  // Safe to treat all dotfiles as junk: hidden files are never scan data,
+  // BIDS itself ignores them, and the companion extensions this tool cares
+  // about (.bval/.bvec/.json) are suffixes rather than leading dots.
+  if (lower.startsWith('.')) return true;
+  return false;
+}
+
+/**
  * Analyze a file's extension and return possible modalities.
  */
 export function detectFromExtension(fileName: string, _relativePath: string): ExtensionResult {
   const lower = fileName.toLowerCase();
+
+  // ── Operating system junk files — never real data ───────────
+  if (isOsJunkFile(fileName)) {
+    return {
+      possibleModalities: ['other'],
+      bestGuess: 'other',
+      reason: {
+        layer: 'extension',
+        message: `Operating system metadata file ("${fileName}"): not scan data, excluded from export`,
+        weight: 0,
+      },
+    };
+  }
 
   // ── NIfTI (gzipped) — imaging file ──────────────────────────
   // Could be anatomical MRI (T1w, T2w), CT, DWI, fMRI, or field map.
   // Extension alone can't tell which — other layers will refine.
   if (lower.endsWith('.nii.gz')) {
     return {
-      possibleModalities: ['anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-angio', 'ct', 'dwi', 'perf', 'func', 'fmap', 'localizer'],
+      possibleModalities: ['anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-PDw', 'anat-T2starw', 'anat-angio', 'ct', 'ct-ac', 'pet', 'dwi', 'perf', 'func', 'fmap', 'localizer'],
       bestGuess: null, // need filename/folder keywords to narrow down
       reason: {
         layer: 'extension',
-        message: 'NIfTI gzipped file — imaging data (MRI or CT)',
+        message: 'NIfTI gzipped file: imaging data (MRI, CT or PET)',
         weight: 0.3,
       },
     };
@@ -47,11 +99,11 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
   // the exporter gzips it automatically, so this is just informational.
   if (lower.endsWith('.nii') && !lower.endsWith('.nii.gz')) {
     return {
-      possibleModalities: ['anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-angio', 'ct', 'dwi', 'perf', 'func', 'fmap', 'localizer'],
+      possibleModalities: ['anat-T1w', 'anat-T2w', 'anat-FLAIR', 'anat-PDw', 'anat-T2starw', 'anat-angio', 'ct', 'ct-ac', 'pet', 'dwi', 'perf', 'func', 'fmap', 'localizer'],
       bestGuess: null,
       reason: {
         layer: 'extension',
-        message: 'Uncompressed NIfTI (.nii) — will be compressed to .nii.gz automatically on export',
+        message: 'Uncompressed NIfTI (.nii): will be compressed to .nii.gz automatically on export',
         weight: 0.3,
       },
     };
@@ -65,7 +117,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: null, // need filename/folder to distinguish eeg vs ieeg
       reason: {
         layer: 'extension',
-        message: 'EDF/BDF file — electrophysiology recording (EEG or iEEG)',
+        message: 'EDF/BDF file: electrophysiology recording (EEG or iEEG)',
         weight: 0.4,
       },
     };
@@ -79,7 +131,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'ieeg',
       reason: {
         layer: 'extension',
-        message: 'NWB file — intracranial EEG (Neurodata Without Borders)',
+        message: 'NWB file: intracranial EEG (Neurodata Without Borders)',
         weight: 0.9,
       },
     };
@@ -93,7 +145,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'ieeg',
       reason: {
         layer: 'extension',
-        message: 'Persyst .dat file — intracranial EEG (requires matching .lay file)',
+        message: 'Persyst .dat file: intracranial EEG (requires matching .lay file)',
         weight: 0.8,
       },
     };
@@ -106,7 +158,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'ieeg',
       reason: {
         layer: 'extension',
-        message: 'Persyst .lay layout file — companion to iEEG .dat file',
+        message: 'Persyst .lay layout file: companion to iEEG .dat file',
         weight: 0.8,
       },
     };
@@ -119,7 +171,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'dwi',
       reason: {
         layer: 'extension',
-        message: 'b-values file — diffusion MRI companion',
+        message: 'b-values file: diffusion MRI companion',
         weight: 0.9,
       },
     };
@@ -132,7 +184,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'dwi',
       reason: {
         layer: 'extension',
-        message: 'b-vectors file — diffusion MRI companion',
+        message: 'b-vectors file: diffusion MRI companion',
         weight: 0.9,
       },
     };
@@ -147,7 +199,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'sidecar-json',
       reason: {
         layer: 'extension',
-        message: 'JSON sidecar — metadata for an imaging or recording file',
+        message: 'JSON sidecar: metadata for an imaging or recording file',
         weight: 0.5,
       },
     };
@@ -164,7 +216,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
         bestGuess: 'electrodes',
         reason: {
           layer: 'extension',
-          message: 'TSV file with "electrode" in name — electrode position metadata',
+          message: 'TSV file with "electrode" in name: electrode position metadata',
           weight: 0.9,
         },
       };
@@ -175,7 +227,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
         bestGuess: 'channels',
         reason: {
           layer: 'extension',
-          message: 'TSV file with "channel" in name — channel description metadata',
+          message: 'TSV file with "channel" in name: channel description metadata',
           weight: 0.9,
         },
       };
@@ -186,7 +238,7 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
         bestGuess: 'events',
         reason: {
           layer: 'extension',
-          message: 'TSV file with "event" in name — event timing metadata',
+          message: 'TSV file with "event" in name: event timing metadata',
           weight: 0.9,
         },
       };
@@ -203,13 +255,33 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
   }
 
   // ── CSV — wrong format, should be TSV ───────────────────────
+  // electrodes / channels / events tables saved from a spreadsheet are
+  // recognized like their .tsv versions and converted to TSV on export
+  // (lib/bids/delimitedText.ts).
   if (lower.endsWith('.csv')) {
+    for (const [word, modality, what] of [
+      ['electrode', 'electrodes', 'electrode position'],
+      ['channel', 'channels', 'channel description'],
+      ['event', 'events', 'event timing'],
+    ] as const) {
+      if (lower.includes(word)) {
+        return {
+          possibleModalities: [modality],
+          bestGuess: modality,
+          reason: {
+            layer: 'extension',
+            message: `CSV file with "${word}" in name: ${what} metadata, converted to TSV on export`,
+            weight: 0.9,
+          },
+        };
+      }
+    }
     return {
       possibleModalities: ['sidecar-tsv'],
       bestGuess: 'sidecar-tsv',
       reason: {
         layer: 'extension',
-        message: 'WARNING: CSV file detected — BIDS requires TSV format, not CSV',
+        message: 'WARNING: CSV file detected: BIDS requires TSV. It is converted to TSV on export if it pairs with a data file of the same name; otherwise it is not exported',
         weight: 0.3,
       },
     };
@@ -222,7 +294,22 @@ export function detectFromExtension(fileName: string, _relativePath: string): Ex
       bestGuess: 'other',
       reason: {
         layer: 'extension',
-        message: 'WARNING: DICOM file detected — must be converted to NIfTI (.nii.gz) before upload',
+        message: 'WARNING: DICOM file detected: must be converted to NIfTI (.nii.gz) first; not exported',
+        weight: 0.9,
+      },
+    };
+  }
+
+  // ── ECAT — Siemens PET format, must be converted ────────────
+  // BIDS PET accepts NIfTI only. PET2BIDS converts ECAT (ecatpet2bids)
+  // and fills the PET sidecar fields at the same time.
+  if (lower.endsWith('.v') || lower.endsWith('.v.gz')) {
+    return {
+      possibleModalities: ['other'],
+      bestGuess: 'other',
+      reason: {
+        layer: 'extension',
+        message: 'WARNING: ECAT PET file detected: must be converted to NIfTI (.nii.gz) before export, e.g. with PET2BIDS (ecatpet2bids)',
         weight: 0.9,
       },
     };

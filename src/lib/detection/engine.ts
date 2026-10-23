@@ -24,35 +24,175 @@ import type {
   Session,
   Confidence,
   DetectionReason,
+  PetInfo,
+  NiftiHeaderInfo,
 } from '../../types/detection';
-import { detectFromExtension } from './extensionDetector';
-import { detectFromFilename, detectFromSidecarText } from './filenameDetector';
+import { detectFromExtension, isOsJunkFile } from './extensionDetector';
+import { detectFromFilename, detectFromSidecarText, derivedDiffusionKind, derivedProjectionKind, normalizeForKeywords } from './filenameDetector';
 import { detectFromFolderPath } from './folderDetector';
-import { inferFromNeighbors } from './neighborInference';
+import { inferFromNeighbors, getFolderPath } from './neighborInference';
 import { groupIntoSubject } from './subjectGrouping';
-import { getSidecarBaseName } from './sidecarReader';
+import { buildFolderSessionMap, neighborPropagationReason } from './customSessionNeighborPropagation';
+import { sidecarKey } from './sidecarReader';
+import { PET_PATTERN, PET_ONLY_SIDECAR_FIELDS, isPetContextPath, tracerLabel, reconstructionFromName } from './petVocabulary';
 import type { SidecarInfo } from './sidecarReader';
 import { computeBidsNames } from '../bids/bidsNaming';
+import type { EdfHeaderInfo } from './edfHeaderReader';
+import { detectCustomSession } from './customSessionDetector';
+import { assignDateClusterSessions } from './dateClusterDetector';
+import type { DatedFile, DateClusterAssignment } from './dateClusterDetector';
+import { assignFolderClusterSessions } from './folderClusterDetector';
+import type { FolderedFile, FolderClusterAssignment } from './folderClusterDetector';
+import { resolveSessionIds, createDefaultDatasetStructure } from '../../types/sessionStructure';
+import type { DatasetStructure } from '../../types/sessionStructure';
+
+// ── Session-structure awareness (Phase 1, July 2026) ────────────────
+// Everything below that guesses a session from fuzzy keywords (filename
+// keywords, folder path keywords, neighbor CT+iEEG inference, the
+// modality-based fallback) is specific to the Implant sessions preset --
+// there's no keyword vocabulary or clinical heuristic that generalizes to
+// an arbitrary study's Custom timepoints. When the active structure is
+// Custom timepoints, those fuzzy layers are skipped for session purposes
+// (they still run for modality, which is orthogonal to session structure)
+// and detectCustomSession() does a literal match against the known
+// timepoint labels instead. See Documents/Phase1_Flexible_Folder_Structure_Spec.md.
 
 // BIDS filename and path generation lives in lib/bids/bidsNaming.ts, the
 // single source of truth shared with the exporter and the validator.
 // runDetection() calls computeBidsNames() over the whole result set
 // before returning, so repeated modalities get unique run- entities.
 
+/**
+ * The image base name, or null for anything that is not a NIfTI image.
+ * Used by the duplicate-series check, which only ever compares images --
+ * a .json / .bval / .bvec companion is paired separately by base name in
+ * lib/bids/bidsNaming.ts and must not be mistaken for a duplicate.
+ */
+function imageStemOf(fileName: string): string | null {
+  if (/\.nii\.gz$/i.test(fileName)) return fileName.slice(0, -7);
+  if (/\.nii$/i.test(fileName)) return fileName.slice(0, -4);
+  return null;
+}
+
 // ── Confidence calculation ────────────────────────────────────────
 
 /**
  * Calculate overall confidence from the accumulated detection reasons.
  */
+/**
+ * Mark the name-based modality evidence gathered so far as overruled.
+ * Used when the sidecar's structured DICOM Modality contradicts it: the
+ * reason stays visible in the mapping table (so the user can see what the
+ * name suggested), but no longer counts toward the modality-evidence floor
+ * or modalityIsGuess.
+ */
+function overruleModalityReasons(reasons: DetectionReason[], why: string): void {
+  for (let i = 0; i < reasons.length; i++) {
+    const r = reasons[i];
+    if (r.supports === 'modality' && (r.layer === 'filename' || r.layer === 'extension')) {
+      reasons[i] = { ...r, supports: undefined, weight: 0, message: `${r.message} (overruled: ${why})` };
+    }
+  }
+}
+
+/**
+ * PET details for a NIfTI file: tracer, attenuation correction, framing,
+ * and which sidecar fields exist. Returned only when there's some PET
+ * evidence (sidecar or name), so ordinary MRI results don't carry it.
+ * See DetectionResult.pet.
+ */
+function petInfoFor(file: ScannedFile, sidecar: SidecarInfo | undefined, modality: Modality, nifti?: NiftiHeaderInfo): PetInfo | undefined {
+  if (!/\.nii(\.gz)?$/i.test(file.name)) return undefined;
+  const normalizedName = normalizeForKeywords(file.name.replace(/\.nii(\.gz)?$/i, ''));
+  const hasPetEvidence =
+    modality === 'pet' ||
+    sidecar?.dicomModality === 'PT' ||
+    Boolean(sidecar?.fieldNames.some(f => (PET_ONLY_SIDECAR_FIELDS as readonly string[]).includes(f))) ||
+    PET_PATTERN.test(normalizedName);
+  if (!hasPetEvidence) return undefined;
+
+  const fromName = reconstructionFromName(normalizedName);
+  const sidecarText = sidecar ? normalizeForKeywords(sidecar.scanText) : '';
+  const fromSidecarText = reconstructionFromName(sidecarText);
+  const frameCount = sidecar?.frameCount ?? null;
+  return {
+    tracer:
+      tracerLabel(sidecar?.tracerName, true) ??
+      tracerLabel(normalizedName, false) ??
+      tracerLabel(sidecarText, false),
+    attenuationCorrected: fromName.attenuationCorrected ?? fromSidecarText.attenuationCorrected,
+    // Framing: sidecar frame list first, then the image's own volume count,
+    // then what the name says.
+    dynamic: frameCount !== null
+      ? frameCount > 1
+      : nifti ? nifti.volumes > 1 : (fromName.dynamic ?? fromSidecarText.dynamic),
+    sidecarFields: sidecar ? sidecar.fieldNames : null,
+  };
+}
+
 function calculateConfidence(
   modality: Modality,
   session: Session | null,
   reasons: DetectionReason[],
+  /**
+   * True for the Single session preset (Phase 2, August 2026): this
+   * dataset has no session concept at all, so a null session here is the
+   * expected, correct outcome, not missing evidence. Without this flag
+   * every single-session file would fall through to the "only modality
+   * detected" branch below and get capped at medium/low confidence
+   * purely for lacking something the dataset was never supposed to have,
+   * the same reasoning that already exempts sidecars just above.
+   */
+  sessionless = false,
 ): Confidence {
   if (modality === 'other') return 'unclassified';
 
   // Sum up all weights
   const totalWeight = reasons.reduce((sum, r) => sum + r.weight, 0);
+
+  // ── Modality-evidence floor ────────────────────────────────────
+  // totalWeight above is deliberately dimension-blind: it mixes evidence
+  // about the session, the subject and the modality into one number. That
+  // is fine for grading "how much do we know about this file overall", but
+  // it must NOT be the only gate, because 'high' is what authorises the
+  // exporter to write a file into the BIDS tree under a modality-specific
+  // name (see EXPORTABLE_MODALITIES / SUFFIX in lib/bids/bidsNaming.ts).
+  //
+  // A file can be certain about its session and subject and still have no
+  // idea what kind of scan it is. Real case from the Phase2_MRI corpus,
+  // gre_field_mapping_e1.nii.gz:
+  //
+  //   0.30 extension        "NIfTI gzipped file - imaging data"   (ambiguous)
+  //   0.45 folder           session = ses-2wk                     (not modality)
+  //   0.10 extension        "Defaulting ambiguous NIfTI to T1w - please verify"
+  //   0.30 neighbor         session = pre-implant baseline        (not modality)
+  //   0.30 subject-grouping subject = 01_1204                     (not modality)
+  //   ----
+  //   1.45 -> >= 1.2 -> "high" -> exported as sub-XX_ses-2wk_run-N_T1w.nii.gz
+  //
+  // The only thing that spoke to modality was a 0.10 fallback that says
+  // "please verify" in its own message. Auditing 868 real scans on
+  // 2026-08-17 found 416 files (48%) whose modality came from that
+  // fallback, of which 371 were graded high and exported as fabricated
+  // T1w anatomicals -- field maps, proton-density and diffusion scans
+  // written into anat/ as structural images.
+  //
+  // So: cap confidence by how much evidence actually supports the
+  // MODALITY. A file whose modality rests only on the blind default can
+  // never be graded above 'low', which keeps it in the mapping table for
+  // the user to assign and out of the export. Untagged reasons are
+  // ignored here (they still count toward totalWeight), so this only ever
+  // tightens the grade, never loosens it.
+  const modalityEvidence = reasons
+    .filter(r => r.supports === 'modality')
+    .reduce((sum, r) => sum + r.weight, 0);
+
+  // The blind default contributes exactly 0.1; anything at or below that
+  // means nothing better than a guess ever identified this scan.
+  const MODALITY_EVIDENCE_FLOOR = 0.15;
+  if (modalityEvidence <= MODALITY_EVIDENCE_FLOOR) {
+    return 'low';
+  }
 
   // Sidecars are scored on their own. A JSON / TSV sidecar inherits its
   // session from the data file it pairs with (see computeBidsNames in
@@ -62,7 +202,7 @@ function calculateConfidence(
   // session-aware branches below, otherwise a sidecar whose engine-time
   // session is still null would fall through to the modality-only path
   // and be capped at medium.
-  if (modality === 'sidecar-json' || modality === 'sidecar-tsv') {
+  if (modality === 'sidecar-json' || modality === 'sidecar-tsv' || sessionless) {
     if (totalWeight >= 0.8) return 'high';
     if (totalWeight >= 0.4) return 'medium';
     return 'low';
@@ -98,7 +238,127 @@ export function runDetection(
    * own scan label to classify data files whose own filename is generic.
    */
   sidecarMap?: Map<string, SidecarInfo>,
+  /**
+   * Optional map of filename -> EDF header info, produced by
+   * readEdfHeaders(). When provided, the engine uses signal labels from
+   * the EDF header to resolve the eeg-vs-ieeg ambiguity for .edf/.bdf
+   * files whose filename and folder give no modality clues.
+   */
+  edfHeaderMap?: Map<string, EdfHeaderInfo>,
+  /**
+   * The dataset's chosen session structure. Defaults to the Implant
+   * sessions preset, so existing callers that don't pass this yet see
+   * identical behavior to before Phase 1.
+   */
+  structure: DatasetStructure = createDefaultDatasetStructure(),
+  /**
+   * Optional map of relative path -> NIfTI header, produced by
+   * readNiftiHeaders(). Gives each image's dimensions: a 4D series is
+   * never defaulted to T1w, and names that contradict the dimensions get
+   * a warning. Last so existing callers are unaffected.
+   */
+  niftiHeaderMap?: Map<string, NiftiHeaderInfo>,
 ): DetectionResult[] {
+  const isCustomStructure = structure.presetId === 'custom-timepoints';
+  // Phase 2 addition (August 2026): Single session datasets have no
+  // session concept at all -- every file should end up with session =
+  // null, the same "nothing to guess" treatment Custom timepoints already
+  // gets from the implant-specific fuzzy layers, just with no literal-
+  // label/date-cluster/folder-cluster fallback afterward either (there are
+  // no known session ids to match against). usesImplantHeuristics gates
+  // every implant-only fuzzy-session block below; isCustomStructure alone
+  // still correctly gates the custom-timepoint-only blocks, since it's
+  // false for Single session already. See
+  // Documents/Phase2_Additional_Dataset_Presets_Spec.md.
+  const isSingleSession = structure.presetId === 'single-session';
+  const usesImplantHeuristics = !isCustomStructure && !isSingleSession;
+  const knownSessionIds = isCustomStructure ? resolveSessionIds(structure) : [];
+
+  // ── Pass 0 (Custom timepoints only): date-cluster + folder-cluster ──
+  // session assignment. Layer A (date, spec Section 3.1) and Layer B
+  // (folder structure, spec Section 3.2). Both need full-subject
+  // visibility across all of a subject's files before any single file's
+  // session can be decided, so they run once up front, sharing one pass
+  // over `files` (and one groupIntoSubject call per file) rather than
+  // duplicating that work in two separate loops. Skipped entirely for
+  // the Implant sessions preset.
+  const dateClusterAssignments = new Map<string, DateClusterAssignment>();
+  const dateClusterMismatchByFile = new Map<string, DetectionReason>();
+  const folderClusterAssignments = new Map<string, FolderClusterAssignment>();
+  const folderClusterMismatchByFile = new Map<string, DetectionReason>();
+
+  if (isCustomStructure && knownSessionIds.length > 0) {
+    const subjectDatedFiles = new Map<string, DatedFile[]>();
+    const subjectFolderedFiles = new Map<string, FolderedFile[]>();
+
+    for (const file of files) {
+      // Subject grouping is a pure function of filename/path patterns, so
+      // it's safe to compute here even though Pass 2 below computes it
+      // again per file for the final result -- cheap either way.
+      const groupResult = groupIntoSubject(file, files, knownSessionIds);
+
+      const lowerName = file.name.toLowerCase();
+      const isJsonFile = lowerName.endsWith('.json');
+      const isEdfFile = lowerName.endsWith('.edf') || lowerName.endsWith('.bdf');
+
+      let date: Date | null = null;
+      if (isEdfFile && edfHeaderMap) {
+        date = edfHeaderMap.get(file.relativePath)?.acquisitionDate ?? null;
+      } else if (!isJsonFile && sidecarMap) {
+        date = sidecarMap.get(sidecarKey(file.relativePath))?.acquisitionDate ?? null;
+      }
+
+      if (date) {
+        const bucket = subjectDatedFiles.get(groupResult.groupName) ?? [];
+        bucket.push({ fileName: file.name, relativePath: file.relativePath, date });
+        subjectDatedFiles.set(groupResult.groupName, bucket);
+      }
+
+      // Layer B needs every file's immediate folder, regardless of
+      // whether it has a date -- the folder count/order is what matters.
+      const folderBucket = subjectFolderedFiles.get(groupResult.groupName) ?? [];
+      folderBucket.push({ fileName: file.name, relativePath: file.relativePath, folder: getFolderPath(file.relativePath) });
+      subjectFolderedFiles.set(groupResult.groupName, folderBucket);
+    }
+
+    for (const datedFiles of subjectDatedFiles.values()) {
+      const result = assignDateClusterSessions(datedFiles, knownSessionIds);
+      for (const [relativePath, assignment] of result.assignments) {
+        dateClusterAssignments.set(relativePath, assignment);
+      }
+      if (result.mismatchReason) {
+        for (const df of datedFiles) {
+          dateClusterMismatchByFile.set(df.relativePath, result.mismatchReason);
+        }
+      }
+    }
+
+    for (const [groupName, folderedFiles] of subjectFolderedFiles) {
+      // Layer B is only meant for subjects with no usable acquisition
+      // date on ANY file at all (spec Section 3.2's precondition). If
+      // this subject had even one dated file, Layer A already had a
+      // real signal to work with -- either it resolved things (in which
+      // case there's nothing left for Layer B to do), or it hit a
+      // cluster/timepoint mismatch, which means the dates actively
+      // disagreed with the defined structure. Either way, a naive
+      // folder-identity match (e.g. "everything's in one folder, and
+      // there's only one timepoint, so trivially it matches") must not
+      // silently override that. Skip Layer B entirely for this subject
+      // and let the mismatch stand.
+      if (subjectDatedFiles.has(groupName)) continue;
+
+      const result = assignFolderClusterSessions(folderedFiles, knownSessionIds);
+      for (const [relativePath, assignment] of result.assignments) {
+        folderClusterAssignments.set(relativePath, assignment);
+      }
+      if (result.mismatchReason) {
+        for (const ff of folderedFiles) {
+          folderClusterMismatchByFile.set(ff.relativePath, result.mismatchReason);
+        }
+      }
+    }
+  }
+
   // ── Pass 1: Run layers 1-3 on every file individually ───────
   // These layers only need the file itself, not context from others.
 
@@ -108,6 +368,25 @@ export function runDetection(
     session: Session | null;
     reasons: DetectionReason[];
     possibleModalities: Modality[];
+    /**
+     * Set when DICOM ImageType identified this file authoritatively (a
+     * scanner-derived ADC/FA/TRACEW map). Downstream layers that only
+     * guess -- the blind T1w default at the end of Pass 1, and neighbor
+     * inference in Pass 2 -- must not overwrite that decision.
+     */
+    modalityLocked: boolean;
+    /** Scanner-derived parameter map label, if any. See DetectionResult.derivedLabel. */
+    derivedLabel: string | undefined;
+    /**
+     * Set when a folder name matched the ambiguous bare "post-op" pattern
+     * (see folderDetector.ts) and nothing else resolved a session for
+     * this file yet. Consulted in Pass 2, after Layer 4 neighbor
+     * inference has had a chance to resolve the file to post-implant via
+     * real CT/iEEG evidence. Implant sessions preset only.
+     */
+    ambiguousSessionCandidate: Session | null;
+    pet?: PetInfo;
+    nifti?: NiftiHeaderInfo;
   }[] = [];
 
   for (const file of files) {
@@ -115,10 +394,55 @@ export function runDetection(
     let modality: Modality = 'other';
     let session: Session | null = null;
     let possibleModalities: Modality[] = [];
+    let ambiguousSessionCandidate: Session | null = null;
+    let modalityLocked = false;
+    let derivedLabel: string | undefined;
+
+    // ── OS junk is decided here and nowhere else ────────────────
+    // isOsJunkFile already identifies these (Thumbs.db, .DS_Store, macOS
+    // AppleDouble "._name" resource forks, in-flight copy artifacts), and
+    // detectFromExtension returns 'other' for them -- but that verdict was
+    // then overridden downstream. Layer 2 assigns a modality whenever the
+    // current one is still 'other', so a junk file whose NAME resembles a
+    // scan was reclassified as real data.
+    //
+    // Live example: "._ep2d_diff_sms_aldit_b3k_20170722092027_7.nii.gz.drAITD"
+    // -- an AppleDouble sidecar -- matched the diffusion vocabulary and was
+    // exported as "primary/sub-03_1265/ses-6mo/dwi/..._run-1_dwi.drAITD",
+    // high confidence. It was harmless until "ep2d_diff" became a
+    // recognised diffusion token earlier today, which is exactly the kind
+    // of latent coupling worth closing off rather than patching per name.
+    //
+    // Locking the modality here makes the junk determination final: no
+    // later layer can promote an operating-system artifact into scan data.
+    if (isOsJunkFile(file.name)) {
+      const junkResult = detectFromExtension(file.name, file.relativePath);
+      reasons.push(junkResult.reason);
+      intermediateResults.push({
+        file,
+        modality: 'other',
+        session: null,
+        reasons,
+        possibleModalities: ['other'],
+        modalityLocked: true,
+        derivedLabel: undefined,
+        ambiguousSessionCandidate: null,
+      });
+      continue;
+    }
 
     // Layer 1: Extension
     const extResult = detectFromExtension(file.name, file.relativePath);
-    reasons.push(extResult.reason);
+    // Only tag this as modality evidence when the extension actually pinned
+    // the modality down (bestGuess set, e.g. .bval -> dwi). For an ambiguous
+    // .nii.gz the reason only says "this is imaging data", which is not a
+    // statement about WHICH kind of scan it is and must not be spent from the
+    // modality-evidence budget in calculateConfidence().
+    reasons.push(
+      extResult.bestGuess
+        ? { ...extResult.reason, supports: 'modality' as const }
+        : extResult.reason,
+    );
     possibleModalities = extResult.possibleModalities;
     if (extResult.bestGuess) {
       modality = extResult.bestGuess;
@@ -139,7 +463,11 @@ export function runDetection(
         modality = fnResult.modality;
       }
     }
-    if (fnResult.session) {
+    // Filename session keywords ("preop", "phase1", ...) are specific to
+    // the Implant sessions preset's clinical vocabulary; skip for Custom
+    // timepoints, where a session can only be one of the exact labels the
+    // user defined (matched below via detectCustomSession).
+    if (usesImplantHeuristics && fnResult.session) {
       session = fnResult.session;
     }
 
@@ -151,31 +479,252 @@ export function runDetection(
     // use its scan-name text as a high-signal modality/session clue.
     const isJsonFile = file.name.toLowerCase().endsWith('.json');
     if (sidecarMap && !isJsonFile) {
-      const sidecar = sidecarMap.get(getSidecarBaseName(file.name));
+      const sidecar = sidecarMap.get(sidecarKey(file.relativePath));
       if (sidecar) {
-        const scResult = detectFromSidecarText(sidecar.scanText);
-        if (scResult.modality) {
-          // Apply the sidecar's modality when the file's own name and
-          // extension left it ambiguous, and only when the result is
-          // compatible with what the extension says is possible.
-          const fileNameAmbiguous = modality === 'other' || possibleModalities.length > 1;
-          const compatible =
-            possibleModalities.length === 0 ||
-            possibleModalities.includes(scResult.modality);
-          if (fileNameAmbiguous && compatible) {
-            modality = scResult.modality;
+        // ── DICOM ImageType: authoritative, checked before keywords ──
+        // ImageType is the scanner's structured statement about the image,
+        // so it outranks any guess made from a file or folder name. Its
+        // job here is to catch scanner-computed diffusion parameter maps
+        // (ADC / FA / trace-weighted), which must never be written into a
+        // raw BIDS dwi/ folder: they carry no bval/bvec, so a validator
+        // rejects the dataset and a tractography pipeline could ingest an
+        // ADC map as if it were raw diffusion signal.
+        //
+        // Name matching cannot cover this. dcm2niix often drops the
+        // descriptive suffix and numbers the output instead, so the ADC
+        // map of series 18 lands as
+        // "_ep2d_diff_SliceAcc_b1k_64_20170130080338_18.nii.gz" -- a name
+        // indistinguishable from raw diffusion, whose sidecar reads
+        // ['DERIVED','PRIMARY','DIFFUSION','ADC','ND']. Before this check,
+        // those files were classified dwi at high confidence and exported
+        // into dwi/ alongside the real data (audit 2026-08-17).
+        //
+        // Left as 'other' (-> unclassified) rather than given a modality:
+        // there is no derivative type in the Modality union yet, and BIDS
+        // places these under derivatives/, not in the raw tree. The user
+        // can still assign them in the mapping table.
+        const upperImageType = sidecar.imageType.map(v => v.toUpperCase());
+        const isDerived = upperImageType.includes('DERIVED');
+        const derivedKind = upperImageType.find(v =>
+          v === 'ADC' || v === 'FA' || v === 'TRACEW' || v === 'COLFA' || v === 'EXADC',
+        );
+        if (isDerived && derivedKind) {
+          // Kept as dwi rather than 'other': it IS diffusion data, just
+          // computed by the scanner instead of acquired. The derivedLabel
+          // is what keeps it out of the raw dwi/ folder -- see
+          // DetectionResult.derivedLabel and computeBidsNames.
+          modality = 'dwi';
+          derivedLabel = derivedKind;
+          // Lock it: the filename still reads "ep2d_diff_...", so both the
+          // blind T1w default and neighbor inference would otherwise
+          // re-classify this map as real scan data. Locking also keeps the
+          // now-overruled filename "Diffusion MRI keyword" reason from
+          // counting as live modality evidence.
+          modalityLocked = true;
+          reasons.push({
+            layer: 'sidecar',
+            message: `DICOM ImageType is [${sidecar.imageType.join(', ')}]: scanner-derived ${derivedKind} map, not raw diffusion data. Exported under derivatives/ as desc-${derivedKind}.`,
+            weight: 0,
+          });
+        }
+
+        // ── DICOM Modality / PET-only fields: authoritative ──
+        // The converter records what the scanner said the image is
+        // ("Modality": "PT" / "CT" / "MR"), and only PET sidecars carry
+        // fields like TracerName or InjectedRadioactivity. That outranks
+        // any name. Real PET names collide with MRI and CT vocabulary --
+        // "Brain_3D_OSEM_TOF" (time-of-flight reconstruction, not MR
+        // angiography), "H2O_CBF" (not ASL), "PET_CT_Brain" -- so without
+        // this, PET was filed as angio, perfusion or CT.
+        let sidecarDecidedModality = false;
+        if (!(isDerived && derivedKind)) {
+          const petFields = PET_ONLY_SIDECAR_FIELDS.filter(f => sidecar.fieldNames.includes(f));
+          if (sidecar.dicomModality === 'PT' || petFields.length > 0) {
+            if (modality !== 'pet') overruleModalityReasons(reasons, 'sidecar says PET');
+            modality = 'pet';
+            modalityLocked = true;
+            sidecarDecidedModality = true;
+            reasons.push({
+              layer: 'sidecar',
+              message: sidecar.dicomModality === 'PT'
+                ? `Sidecar "${sidecar.sidecarName}" records DICOM Modality "PT" (PET)`
+                : `Sidecar "${sidecar.sidecarName}" has PET-only fields (${petFields.join(', ')})`,
+              weight: 0.9,
+              supports: 'modality',
+            });
+          } else if (sidecar.dicomModality === 'CT') {
+            // A CT inside a PET study is the attenuation-correction CT.
+            const isCorrectionCt = modality === 'ct-ac' || isPetContextPath(file.relativePath);
+            const ctModality: Modality = isCorrectionCt ? 'ct-ac' : 'ct';
+            if (modality !== ctModality) overruleModalityReasons(reasons, 'sidecar says CT');
+            modality = ctModality;
+            modalityLocked = true;
+            sidecarDecidedModality = true;
+            reasons.push({
+              layer: 'sidecar',
+              message: isCorrectionCt
+                ? `Sidecar "${sidecar.sidecarName}" records DICOM Modality "CT" inside a PET study: attenuation-correction CT, not exported`
+                : `Sidecar "${sidecar.sidecarName}" records DICOM Modality "CT"`,
+              weight: 0.9,
+              supports: 'modality',
+            });
+          } else if (sidecar.dicomModality === 'MR' && (modality === 'pet' || modality === 'ct' || modality === 'ct-ac')) {
+            // An MR image whose name reads as PET or CT (e.g. a PET/MR
+            // study's MRI series under a "PET_MR" name). Drop the name's
+            // verdict and let the sidecar's scan name decide below.
+            overruleModalityReasons(reasons, 'sidecar says MR');
+            modality = 'other';
+            reasons.push({
+              layer: 'sidecar',
+              message: `Sidecar "${sidecar.sidecarName}" records DICOM Modality "MR": this is an MRI image despite its PET/CT name`,
+              weight: 0,
+            });
           }
         }
-        if (scResult.session && !session) {
-          session = scResult.session;
+
+        // Skip keyword matching for a derived map: the sidecar's
+        // SeriesDescription still reads "ep2d_diff_..._ADC", which would
+        // re-classify the file as raw diffusion and undo the decision
+        // above. Session detection below still runs, so the mapping table
+        // shows the file against its real timepoint instead of a blank.
+        const scResultRaw = (isDerived && derivedKind)
+          ? { modality: null, session: null, reasons: [] }
+          : detectFromSidecarText(sidecar.scanText);
+        // Once the DICOM Modality decided, the scan-name text may only add
+        // session clues, not re-decide the modality. Likewise an MR
+        // sidecar's text can't make it PET or CT.
+        const textContradictsDicom =
+          sidecar.dicomModality === 'MR' &&
+          (scResultRaw.modality === 'pet' || scResultRaw.modality === 'ct' || scResultRaw.modality === 'ct-ac');
+        const scResult = sidecarDecidedModality || textContradictsDicom
+          ? { ...scResultRaw, modality: null, reasons: scResultRaw.reasons.filter(r => r.supports !== 'modality') }
+          : scResultRaw;
+        // Compatible when the sidecar's modality guess isn't ruled out by
+        // what this file's own extension says is possible (e.g. a .edf
+        // file's possibleModalities is [eeg, ieeg] -- a sidecar claiming
+        // "ct" can't be describing this file).
+        const compatible =
+          !scResult.modality ||
+          possibleModalities.length === 0 ||
+          possibleModalities.includes(scResult.modality);
+
+        if (compatible) {
+          if (scResult.modality) {
+            // Apply the sidecar's modality when the file's own name and
+            // extension left it ambiguous.
+            const fileNameAmbiguous = modality === 'other' || possibleModalities.length > 1;
+            if (fileNameAmbiguous) {
+              modality = scResult.modality;
+            }
+          }
+          if (usesImplantHeuristics && scResult.session && !session) {
+            session = scResult.session;
+          }
+          // Keyword-match reasons from the sidecar text (modality/session).
+          reasons.push(...scResult.reasons);
+          // Record which sidecar was consulted, for transparency.
+          reasons.push({
+            layer: 'sidecar',
+            message: `Read scan name from sidecar "${sidecar.sidecarName}": "${sidecar.scanText}"`,
+            weight: 0,
+          });
+        } else {
+          // The sidecar's content points to a modality this file's own
+          // extension rules out entirely -- almost certainly an unrelated
+          // file that happens to share a base name (e.g. a lab metadata
+          // .json sitting next to an .edf), not a real dcm2niix sidecar
+          // for this file. Ignore its content rather than surface a
+          // misleading reason. Found via adversarial testing 2026-08-02.
+          reasons.push({
+            layer: 'sidecar',
+            message: `Sidecar "${sidecar.sidecarName}" was found but its content ("${sidecar.scanText}") is incompatible with this file's type, likely an unrelated file sharing the same base name, ignored.`,
+            weight: 0,
+          });
         }
-        // Keyword-match reasons from the sidecar text (modality/session).
-        reasons.push(...scResult.reasons);
-        // Record which sidecar was consulted, for transparency.
+      }
+    }
+
+    // Layer 2c: EDF header signal labels
+    // For .edf/.bdf files, the extension alone can't distinguish scalp EEG
+    // from intracranial EEG (iEEG). When an EDF header was read, use the
+    // channel labels inside the file to resolve this ambiguity even when
+    // the filename and folder contain no keywords (e.g. "HUP282.edf").
+    const isEdfFile = file.name.toLowerCase().endsWith('.edf') || file.name.toLowerCase().endsWith('.bdf');
+    if (edfHeaderMap && isEdfFile) {
+      const edfInfo = edfHeaderMap.get(file.relativePath);
+      if (edfInfo) {
+        if (edfInfo.modalityHint) {
+          // Only override if we're still ambiguous (eeg/ieeg both possible)
+          // or if modality is still 'other'.
+          const ambiguous = modality === 'other' || (possibleModalities.includes('eeg') && possibleModalities.includes('ieeg'));
+          if (ambiguous) {
+            modality = edfInfo.modalityHint;
+            // Reading actual signal labels from the binary file is stronger
+            // evidence than a filename keyword. Weight 0.85 reflects that
+            // certainty -- higher than any keyword match (max 0.6-0.75).
+            reasons.push({
+              layer: 'sidecar',
+              message: `EDF signal labels (${edfInfo.signalLabels.slice(0, 5).join(', ')}${edfInfo.signalLabels.length > 5 ? '...' : ''}) confirm ${edfInfo.modalityHint === 'ieeg' ? 'intracranial EEG' : 'scalp EEG'} - ${edfInfo.numSignals} channels read from file header`,
+              weight: 0.85,
+            });
+          }
+        }
+        // Surface PHI warning if the EDF header contains patient data
+        if (edfInfo.phiLikely) {
+          reasons.push({
+            layer: 'sidecar',
+            message: `WARNING: EDF header patient ID field appears to contain non-anonymized data: "${edfInfo.patientId.slice(0, 40)}". Review before sharing`,
+            weight: 0,
+          });
+        }
+        // Add start date/time as an informational reason if present
+        if (edfInfo.startDate && edfInfo.startDate !== '        ') {
+          reasons.push({
+            layer: 'sidecar',
+            message: `EDF recording date: ${edfInfo.startDate} ${edfInfo.startTime}`.trim(),
+            weight: 0,
+          });
+        }
+      }
+    }
+
+    // Derived-map fallback for files with no JSON sidecar. ImageType is
+    // authoritative and already handled above; this covers the same
+    // situation when there is no sidecar to read, using the suffix the
+    // scanner put in the name (…_ADC, …_FA, …_TRACEW). Skipped when
+    // ImageType already decided, so the sidecar always wins.
+    if (!modalityLocked && /\.nii(\.gz)?$/i.test(file.name)) {
+      const normalizedName = normalizeForKeywords(
+        file.name.replace(/\.nii\.gz$/i, '').replace(/\.nii$/i, ''),
+      );
+      const diffusionKind = derivedDiffusionKind(normalizedName);
+      const projectionKind = derivedProjectionKind(normalizedName);
+      if (diffusionKind) {
+        // A derived diffusion map: force dwi, since the name that produced
+        // this verdict is a diffusion series name.
+        modality = 'dwi';
+        derivedLabel = diffusionKind;
+        modalityLocked = true;
         reasons.push({
-          layer: 'sidecar',
-          message: `Read scan name from sidecar "${sidecar.sidecarName}": "${sidecar.scanText}"`,
-          weight: 0,
+          layer: 'filename',
+          message: `Scanner-derived ${diffusionKind} map (from the scan name; no JSON sidecar to confirm): exported under derivatives/ as desc-${diffusionKind}.`,
+          weight: 0.4,
+          supports: 'modality',
+        });
+      } else if (projectionKind) {
+        // A projection keeps whatever modality its own name established --
+        // a minimum-intensity projection of an SWI volume is still
+        // T2*-weighted anatomy, just reformatted. Only its PLACEMENT
+        // changes, which is what derivedLabel controls. Forcing dwi here
+        // (as the diffusion branch does) filed mIP_Images_SW_ under
+        // derivatives/.../dwi/ as desc-mIP_dwi.
+        derivedLabel = projectionKind;
+        modalityLocked = true;
+        reasons.push({
+          layer: 'filename',
+          message: `Scanner-computed ${projectionKind} projection, not an acquisition: exported under derivatives/ as desc-${projectionKind}.`,
+          weight: 0.4,
+          supports: 'modality',
         });
       }
     }
@@ -183,39 +732,177 @@ export function runDetection(
     // Layer 3: Folder path
     const folderResult = detectFromFolderPath(file.relativePath);
     reasons.push(...folderResult.reasons);
+    // A folder name (e.g. "anat") can only assign a modality when the
+    // file's own extension doesn't actively rule it out. Extension
+    // possibleModalities is ['other'] for an unrecognized or
+    // non-scan-data extension -- e.g. a Thumbs.db thumbnail-cache file,
+    // or any other stray non-imaging file, sitting inside an "anat"
+    // folder. Without this compatibility check, ANY file in a
+    // modality-named folder was silently classified (high confidence)
+    // as that modality regardless of what the file actually was, which
+    // meant it could be exported as fabricated patient data. The
+    // previous code had a second, correctly-gated check right after
+    // this one, but it was permanently dead: by the time it ran,
+    // `modality` was no longer 'other' because the first (ungated)
+    // check above had already blindly overwritten it. Bug found via
+    // adversarial junk-file testing 2026-08-02.
     if (folderResult.modality && modality === 'other') {
-      modality = folderResult.modality;
+      const extensionAllowsThisModality =
+        possibleModalities.length === 0 || possibleModalities.includes(folderResult.modality);
+      if (extensionAllowsThisModality) {
+        modality = folderResult.modality;
+      }
     }
-    // Folder path can also narrow down ambiguous extension results
-    if (folderResult.modality && possibleModalities.includes(folderResult.modality) && modality === 'other') {
-      modality = folderResult.modality;
-    }
-    if (folderResult.session && !session) {
+    if (usesImplantHeuristics && folderResult.session && !session) {
       session = folderResult.session;
+    }
+    // A CT sitting inside a PET study folder with no sidecar to say
+    // otherwise is the PET/CT attenuation-correction CT, not a clinical
+    // CT. In the Implant preset a plain CT would also be filed as
+    // post-implant (electrode localization), which this isn't.
+    if (!modalityLocked && modality === 'ct' && isPetContextPath(file.relativePath)) {
+      modality = 'ct-ac';
+      reasons.push({
+        layer: 'folder',
+        message: 'CT inside a PET study folder: treated as the attenuation-correction CT (not exported). Change it to CT if it is a clinical scan.',
+        weight: 0.3,
+        supports: 'modality',
+      });
+    }
+    // Ambiguous bare "post-op" folder match: stash the candidate instead
+    // of committing to it now, so Layer 4 neighbor inference (below, Pass
+    // 2) gets a chance to resolve it via real CT/iEEG evidence first. See
+    // folderDetector.ts's FolderResult.ambiguousSessionCandidate.
+    if (usesImplantHeuristics && !session && folderResult.ambiguousSessionCandidate) {
+      ambiguousSessionCandidate = folderResult.ambiguousSessionCandidate;
+    }
+
+    // Custom timepoints: literal match against the exact labels the user
+    // defined in structure setup (e.g. "ses-2mo"), not a fuzzy guess.
+    if (isCustomStructure && !session) {
+      const customResult = detectCustomSession(file.relativePath, knownSessionIds);
+      if (customResult.session) {
+        session = customResult.session;
+        reasons.push(...customResult.reasons);
+      }
+    }
+
+    // Custom timepoints Layer A fallback: date-cluster chronological
+    // ordering (see dateClusterDetector.ts / Pass 0 above). Only consulted
+    // when the literal label match just above found nothing. If this
+    // subject's date-cluster count didn't match its timepoint count, this
+    // surfaces the mismatch reason instead of silently leaving the file
+    // unexplained.
+    if (isCustomStructure && !session) {
+      const dateAssignment = dateClusterAssignments.get(file.relativePath);
+      if (dateAssignment) {
+        session = dateAssignment.session;
+        reasons.push(...dateAssignment.reasons);
+      } else {
+        const mismatch = dateClusterMismatchByFile.get(file.relativePath);
+        if (mismatch) {
+          reasons.push(mismatch);
+        }
+      }
+    }
+
+    // Custom timepoints Layer B fallback: folder-cluster structural
+    // ordering (see folderClusterDetector.ts / Pass 0 above). Only
+    // reached if neither the literal label match nor the date-cluster
+    // layer above found anything for this file.
+    if (isCustomStructure && !session) {
+      const folderAssignment = folderClusterAssignments.get(file.relativePath);
+      if (folderAssignment) {
+        session = folderAssignment.session;
+        reasons.push(...folderAssignment.reasons);
+      } else {
+        const mismatch = folderClusterMismatchByFile.get(file.relativePath);
+        if (mismatch) {
+          reasons.push(mismatch);
+        }
+      }
+    }
+
+    // ── NIfTI header: dimensions ────────────────────────────────
+    // What the image itself says. Used to keep the blind T1w default off
+    // 4D series and to flag names that contradict the dimensions. Only a
+    // warning, never an override: multi-echo anatomicals can be 4D, and a
+    // single-volume functional reference is 3D.
+    const nifti = niftiHeaderMap?.get(file.relativePath);
+    const isSeries = nifti ? nifti.volumes > 1 : false;
+    if (nifti) {
+      const size = nifti.dims.slice(0, 3).join('×');
+      const mm = nifti.voxelSize.map(v => Number(v.toFixed(2))).join('×');
+      reasons.push({
+        layer: 'sidecar',
+        message: isSeries
+          ? `NIfTI header: ${size} voxels (${mm} mm), ${nifti.volumes} volumes`
+          : `NIfTI header: ${size} voxels (${mm} mm), a single 3D volume`,
+        weight: 0,
+      });
+      if (isSeries && modality.startsWith('anat-')) {
+        reasons.push({
+          layer: 'sidecar',
+          message: `WARNING: the name says ${modality.replace('anat-', '')}, but the image has ${nifti.volumes} volumes; anatomical scans usually have one. Check the modality.`,
+          weight: 0,
+        });
+      } else if (!isSeries && (modality === 'func' || modality === 'dwi') && !derivedLabel) {
+        reasons.push({
+          layer: 'sidecar',
+          message: `WARNING: the name says ${modality === 'func' ? 'functional MRI' : 'diffusion'}, but the image is a single 3D volume; these are usually series. Check the modality.`,
+          weight: 0,
+        });
+      }
     }
 
     // If we still have an ambiguous .nii.gz with no modality clues,
-    // default to anat-T1w (most common type)
-    if (modality === 'other' && possibleModalities.length > 1 &&
+    // default to anat-T1w (most common type). Never for a 4D series: that
+    // is fMRI, diffusion or dynamic PET, not an anatomical scan, so it is
+    // left unclassified for the user (or neighbor inference) to decide.
+    if (modality === 'other' && !modalityLocked && possibleModalities.length > 1 && isSeries) {
+      reasons.push({
+        layer: 'extension',
+        message: `Not defaulted to T1w: the NIfTI header shows ${nifti!.volumes} volumes, so this is a series (fMRI, diffusion or dynamic PET). Pick the modality.`,
+        weight: 0,
+      });
+    } else if (modality === 'other' && !modalityLocked && possibleModalities.length > 1 &&
         file.name.toLowerCase().endsWith('.nii.gz')) {
       modality = 'anat-T1w';
       reasons.push({
         layer: 'extension',
-        message: 'Defaulting ambiguous NIfTI to T1w (most common) — please verify',
+        message: 'Defaulting ambiguous NIfTI to T1w (most common) - please verify',
         weight: 0.1,
+        supports: 'modality',
       });
     }
 
-    intermediateResults.push({ file, modality, session, reasons, possibleModalities });
+    const pet = petInfoFor(file, sidecarMap?.get(sidecarKey(file.relativePath)), modality, nifti);
+    intermediateResults.push({ file, modality, session, reasons, possibleModalities, modalityLocked, derivedLabel, ambiguousSessionCandidate, pet, nifti });
   }
 
   // ── Build known modalities map for neighbor inference ────────
   const knownModalities = new Map<string, Modality>();
   for (const result of intermediateResults) {
     if (result.modality !== 'other') {
-      knownModalities.set(result.file.name, result.modality);
+      // Keyed by path, like the sidecar and EDF maps: same-named files in
+      // different subjects' folders must not share a modality.
+      knownModalities.set(result.file.relativePath, result.modality);
     }
   }
+
+  // ── Custom timepoints Layer C: neighbor propagation (spec Section 3.3) ──
+  // Built once from every file already resolved by the literal match or
+  // Layer A (date-cluster) above, so an undated file (channels.tsv,
+  // electrodes.tsv, a sidecar-less data file) can inherit its folder
+  // neighbor's session in Pass 2 below. Folders where resolved files
+  // disagree are excluded (see customSessionNeighborPropagation.ts).
+  const customFolderSessionMap = isCustomStructure
+    ? buildFolderSessionMap(
+        intermediateResults
+          .filter((r): r is typeof r & { session: string } => r.session !== null)
+          .map(r => ({ fileName: r.file.name, relativePath: r.file.relativePath, session: r.session })),
+      )
+    : new Map<string, string>();
 
   // ── Pass 2: Run layers 4-5 with context ─────────────────────
 
@@ -223,13 +910,21 @@ export function runDetection(
 
   for (const intermediate of intermediateResults) {
     const { file } = intermediate;
+
+    // OS junk files (.DS_Store, dot-prefixed temp files, Thumbs.db, etc.)
+    // were locked as 'other' in Pass 1. Drop them entirely so they never
+    // appear in the mapping table — users should not have to review files
+    // that are never scan data.
+    if (intermediate.modalityLocked && intermediate.modality === 'other') continue;
+
     let { modality, session } = intermediate;
     const reasons = [...intermediate.reasons];
 
     // Layer 4: Neighbor inference
     const neighborResult = inferFromNeighbors(file, files, knownModalities);
     reasons.push(...neighborResult.reasons);
-    if (neighborResult.modality && (modality === 'other' || modality === 'sidecar-json')) {
+    if (neighborResult.modality && !intermediate.modalityLocked &&
+        (modality === 'other' || modality === 'sidecar-json')) {
       if (modality === 'sidecar-json' && neighborResult.modality) {
         // JSON sidecars: keep sidecar-json as modality but note what it pairs with
         // (we don't change the modality, just add the reason)
@@ -237,15 +932,73 @@ export function runDetection(
         modality = neighborResult.modality;
       }
     }
-    if (neighborResult.session && !session) {
-      session = neighborResult.session;
+    // Neighbor session inference (e.g. "CT + iEEG in group -> post-implant")
+    // encodes implant-specific clinical logic; skip for Custom timepoints.
+    if (usesImplantHeuristics && neighborResult.session && !session) {
+      // Guard: a file with a pending ambiguous "post-op" candidate (see
+      // the ambiguous-postop resolution block below) can never
+      // legitimately resolve to pre-implant -- a "post-" folder cannot
+      // also be "pre-implant." Without this guard, neighborInference.ts's
+      // generic "no CT/iEEG nearby -> preimplant" default (a much weaker,
+      // catch-all rule) fires first and silently overrides the pending
+      // candidate with a contradictory answer before the dedicated
+      // ambiguous-postop fallback below ever gets a turn. The stronger
+      // "CT + iEEG -> postimplant" neighbor rule is unaffected by this
+      // guard, since it never proposes preimplant. Found via adversarial
+      // testing 2026-08-02 while verifying the post-op-ambiguity fix.
+      const wouldContradictPendingPostOp =
+        intermediate.ambiguousSessionCandidate === 'ses-postsurgery' && neighborResult.session === 'ses-preimplant';
+      if (!wouldContradictPendingPostOp) {
+        session = neighborResult.session;
+      }
     }
 
     // Layer 5: Subject grouping
     const groupResult = groupIntoSubject(file, files);
     reasons.push(...groupResult.reasons);
-    if (groupResult.session && !session) {
+    // Subject grouping's embedded session inference uses the same implant
+    // keyword vocabulary as the filename/folder detectors; skip for Custom
+    // timepoints for the same reason.
+    if (usesImplantHeuristics && groupResult.session && !session) {
       session = groupResult.session;
+    }
+
+    // Ambiguous "post-op" folder-name resolution (Implant sessions only).
+    // A bare "post-op"/"postop" folder name deliberately did NOT set a
+    // session in Pass 1 or in Layer 5 above, so that Layer 4's neighbor
+    // inference (just above) had a real chance to resolve it correctly
+    // via CT/iEEG evidence in the group -- that rule already exists and
+    // now actually gets to run for this case. If neighbor inference still
+    // didn't find CT+iEEG (e.g. only a lone CT, or imaging-only), fall
+    // back to the site's most likely original intent (post-surgery) here,
+    // with an explicit lower-confidence corrective reason -- this must
+    // run BEFORE the generic default-by-modality fallback below, which
+    // would otherwise guess pre-implant baseline for an imaging-only file
+    // and be equally likely wrong. Bug found via full-pipeline adversarial
+    // testing 2026-08-02 (a "PostOp/CT" folder was silently misclassified
+    // as post-surgery every time).
+    if (usesImplantHeuristics && !session) {
+      const ambiguousSessionCandidate = intermediate.ambiguousSessionCandidate ?? groupResult.ambiguousSessionCandidate;
+      if (ambiguousSessionCandidate) {
+        session = ambiguousSessionCandidate;
+        reasons.push({
+          layer: 'folder',
+          message: `Ambiguous "post-op" folder name: no CT/iEEG evidence found nearby to indicate post-implant monitoring, so assumed post-surgery follow-up instead. Please verify this session assignment.`,
+          weight: 0.2,
+        });
+      }
+    }
+
+    // Layer C: neighbor propagation (Custom timepoints only, spec Section
+    // 3.3). Only reached if the literal match and date-cluster layer
+    // (both applied earlier, in Pass 1) found nothing for this file.
+    if (isCustomStructure && !session) {
+      const folder = getFolderPath(file.relativePath);
+      const propagated = customFolderSessionMap.get(folder);
+      if (propagated) {
+        session = propagated;
+        reasons.push(neighborPropagationReason(propagated));
+      }
     }
 
     // ── Session fallback: default by modality ──────────────────
@@ -261,7 +1014,14 @@ export function runDetection(
     // during pairing (see computeBidsNames in lib/bids/bidsNaming.ts).
     // This is a deliberately low-confidence guess the user can
     // override in the mapping table.
+    // This modality-based guess ("CT/iEEG implies post-implant, everything
+    // else implies pre-implant baseline") only makes sense for the Implant
+    // sessions preset. For Custom timepoints there's no generalizable
+    // heuristic, so an unmatched file is left with session = null and
+    // surfaces as unclassified in the mapping table for the user to assign
+    // manually -- correct behavior, not a bug, for an arbitrary study.
     if (
+      usesImplantHeuristics &&
       !session &&
       modality !== 'other' &&
       modality !== 'sidecar-json' &&
@@ -286,7 +1046,7 @@ export function runDetection(
     }
 
     // ── Calculate final confidence ─────────────────────────────
-    const confidence = calculateConfidence(modality, session, reasons);
+    const confidence = calculateConfidence(modality, session, reasons, isSingleSession);
 
     // ── Generate BIDS filename preview ─────────────────────────
     // The BIDS filename and path are assigned after this loop, in one
@@ -301,6 +1061,56 @@ export function runDetection(
       });
     }
 
+    // ── Same series converted twice ─────────────────────────────
+    // dcm2niix emits one acquisition under two names in the same folder:
+    // the bare series name and a decorated
+    // _<series>_<timestamp>_<seriesNumber>. Detection is a deterministic
+    // name relationship, never a similarity guess -- stripping the leading
+    // underscore and the trailing _<timestamp>_<number> from the decorated
+    // name must yield this file's exact base name, in this file's folder.
+    //
+    // Verified over the Phase2_MRI corpus 2026-08-17: matched 117 folders
+    // / 236 files, and left alone the 139 folders holding genuinely
+    // different images (magnitude vs. phase "_ph", dcm2niix collision
+    // variants ending in "a").
+    //
+    // The timestamp width varies: dcm2niix writes the full
+    // YYYYMMDDHHMMSS (14 digits) in most of this corpus, but also bare
+    // HHMMSS (6) and HMMSS with the leading zero dropped (5). An earlier
+    // \d{8,14} caught only the 14-digit form and missed 54 files. The
+    // range is safe to keep wide because the real safeguard is the twin
+    // check below -- the stripped name must exist as an actual file in the
+    // same folder, which a coincidental "_<digits>_<digits>" ending will
+    // not satisfy.
+    //
+    // Only the BARE copy is ever marked. The decorated copy carries the
+    // .json sidecar in 118 of 119 real pairs (the bare copy in none), and
+    // that sidecar is where ImageType comes from, so it is the more
+    // complete file and the one worth keeping.
+    let duplicateOf: string | undefined;
+    const thisStem = imageStemOf(file.name);
+    if (thisStem) {
+      const thisFolder = getFolderPath(file.relativePath);
+      const decoratedTwin = files.find(other => {
+        if (other.name === file.name) return false;
+        if (getFolderPath(other.relativePath) !== thisFolder) return false;
+        const otherStem = imageStemOf(other.name);
+        if (!otherStem) return false;
+        const m = otherStem.match(/^_(.+)_\d{5,14}_\d+$/);
+        return m ? m[1] === thisStem : false;
+      });
+      if (decoratedTwin) duplicateOf = decoratedTwin.name;
+    }
+
+    // A modality resting only on the blind default is a guess, not a
+    // detection. Recorded explicitly so the BIDS namer can keep it out of
+    // primary/ -- see DetectionResult.modalityIsGuess for why confidence
+    // alone was not enough.
+    const modalityIsGuess =
+      reasons
+        .filter(r => r.supports === 'modality')
+        .reduce((sum, r) => sum + r.weight, 0) <= 0.15;
+
     finalResults.push({
       relativePath: file.relativePath,
       fileName: file.name,
@@ -310,6 +1120,11 @@ export function runDetection(
       detectedSession: session,
       detectedModality: modality,
       confidence,
+      modalityIsGuess,
+      duplicateOf,
+      derivedLabel: intermediate.derivedLabel,
+      pet: intermediate.pet,
+      niftiHeader: intermediate.nifti,
       reasons,
       userSession: null,
       userModality: null,
@@ -321,7 +1136,7 @@ export function runDetection(
 
   // Assign BIDS filenames and paths (run / field-map entities and sidecar
   // pairing) in one pass, so repeated modalities never collide.
-  return computeBidsNames(finalResults);
+  return computeBidsNames(finalResults, undefined, structure);
 }
 
 // ── Summary generation ────────────────────────────────────────────
@@ -329,7 +1144,19 @@ export function runDetection(
 /**
  * Generate a summary of detection results for display in the UI.
  */
-export function generateSummary(results: DetectionResult[]): DetectionSummary {
+export function generateSummary(
+  results: DetectionResult[],
+  /**
+   * The dataset's chosen session structure. Defaults to Implant sessions
+   * so existing callers see identical behavior to before Phase 1. The
+   * missing-required-file check below (T1w at pre-implant, CT+iEEG at
+   * post-implant) is specific to that preset's known clinical protocol --
+   * Custom timepoints datasets can represent any study protocol, so no
+   * per-timepoint modality requirement is enforced for them (confirmed
+   * with Brandon 2026-07-31; see the spec doc).
+   */
+  structure: DatasetStructure = createDefaultDatasetStructure(),
+): DetectionSummary {
   const summary: DetectionSummary = {
     totalFiles: results.length,
     highConfidence: 0,
@@ -363,7 +1190,12 @@ export function generateSummary(results: DetectionResult[]): DetectionSummary {
   summary.subjectGroups = Array.from(groupSet).sort();
 
   // ── Check for missing required files per subject/session ────
-  for (const group of summary.subjectGroups) {
+  // Implant-specific: skip entirely for Custom timepoints and Single
+  // session (see param doc above; the latter never assigns ses-preimplant/
+  // ses-postimplant labels in the first place, so this loop was already a
+  // no-op for it, but the condition is spelled out explicitly rather than
+  // relying on that incidentally).
+  for (const group of structure.presetId === 'implant' ? summary.subjectGroups : []) {
     const groupFiles = results.filter(r => r.subjectGroup === group);
 
     // Check ses-preimplant: T1w required

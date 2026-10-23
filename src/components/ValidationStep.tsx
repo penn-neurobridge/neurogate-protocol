@@ -3,7 +3,9 @@ import Button from './Button';
 import type { DetectionResult } from '../types/detection';
 import type { SubjectMetadata, DatasetDescription, DefacingAttestation, InstitutionConfig } from '../types/metadata';
 import type { ValidationReport, ValidationIssue, ValidationCategory, ValidationSeverity } from '../types/validation';
+import type { DatasetStructure } from '../types/sessionStructure';
 import { runValidation } from '../lib/validation';
+import { useAudit } from '../lib/audit';
 import { FolderIcon, ShieldIcon, ClipboardIcon, LinkIcon, FileIcon, TagIcon, BrainIcon, CheckCircleIcon, XCircleIcon } from './Icons';
 
 interface ValidationStepProps {
@@ -12,7 +14,10 @@ interface ValidationStepProps {
   datasetDescription: DatasetDescription;
   defacingAttestation: DefacingAttestation;
   institutionConfig: InstitutionConfig;
-  onContinue: () => void;
+  /** The dataset's chosen session structure, passed through to the required-files and cross-session checkers so Single session datasets aren't flagged for lacking sessions they were never supposed to have. */
+  structure: DatasetStructure;
+  /** Called with the issues the user dismissed, so the hand-off to Export can record them. */
+  onContinue: (dismissed: ValidationIssue[]) => void;
   onBack: () => void;
 }
 
@@ -26,6 +31,7 @@ const CATEGORY_INFO: Record<ValidationCategory, { label: string; icon: ReactNode
   'file-format': { label: 'File Format', icon: <FileIcon size={18} /> },
   'metadata': { label: 'Metadata', icon: <TagIcon size={18} /> },
   'defacing': { label: 'Defacing', icon: <BrainIcon size={18} /> },
+  'consistency': { label: 'Consistency', icon: <LinkIcon size={18} /> },
 };
 
 const SEVERITY_STYLES: Record<ValidationSeverity, { bg: string; text: string; label: string; border: string }> = {
@@ -40,9 +46,11 @@ export default function ValidationStep({
   datasetDescription,
   defacingAttestation,
   institutionConfig,
+  structure,
   onContinue,
   onBack,
 }: ValidationStepProps) {
+  const audit = useAudit();
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [isRunning, setIsRunning] = useState(true);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
@@ -52,36 +60,47 @@ export default function ValidationStep({
 
   // ── Run validation on mount ───────────────────────────────
   useEffect(() => {
+    let cancelled = false;
+
     // Small delay so the UI shows the running state
     const timer = setTimeout(() => {
-      const result = runValidation({
+      runValidation({
         detectionResults,
         subjects,
         datasetDescription,
         defacingAttestation,
         institutionConfig,
+        structure,
+      }).then((result) => {
+        if (cancelled) return;
+        setReport(result);
+        setIsRunning(false);
       });
-      setReport(result);
-      setIsRunning(false);
     }, 800);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   // ── Rerun validation ──────────────────────────────────────
   const handleRerun = () => {
     setIsRunning(true);
+    if (dismissedIds.size > 0) audit.logDismissalsCleared(dismissedIds.size);
     setDismissedIds(new Set());
     setTimeout(() => {
-      const result = runValidation({
+      runValidation({
         detectionResults,
         subjects,
         datasetDescription,
         defacingAttestation,
         institutionConfig,
+        structure,
+      }).then((result) => {
+        setReport(result);
+        setIsRunning(false);
       });
-      setReport(result);
-      setIsRunning(false);
     }, 500);
   };
 
@@ -115,8 +134,10 @@ export default function ValidationStep({
     });
   };
 
-  const dismissIssue = (id: string) => {
-    setDismissedIds(prev => new Set(prev).add(id));
+  const dismissIssue = (issue: ValidationIssue) => {
+    if (dismissedIds.has(issue.id)) return;
+    audit.logIssueDismissed(issue);
+    setDismissedIds(prev => new Set(prev).add(issue.id));
   };
 
   // ── Loading state ─────────────────────────────────────────
@@ -153,7 +174,7 @@ export default function ValidationStep({
           </div>
           <button
             onClick={handleRerun}
-            className="px-4 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+            className="btn-cta px-4 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
           >
             Re-run Checks
           </button>
@@ -168,7 +189,7 @@ export default function ValidationStep({
             <button
               key={cat}
               onClick={() => setFilterCategory(filterCategory === cat ? 'all' : cat)}
-              className={`p-3 rounded-lg border text-left transition-colors ${
+              className={`btn-cta p-3 rounded-lg border text-left transition-colors ${
                 filterCategory === cat
                   ? 'border-[#011F5B] bg-blue-50'
                   : 'border-gray-200 bg-white hover:border-gray-300'
@@ -193,7 +214,7 @@ export default function ValidationStep({
             <button
               key={sev}
               onClick={() => setFilterSeverity(sev)}
-              className={`px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
+              className={`btn-cta px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
                 filterSeverity === sev
                   ? 'bg-[#011F5B] text-white'
                   : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
@@ -218,7 +239,7 @@ export default function ValidationStep({
         {filteredIssues.length === 0 ? (
           <div className="text-center py-12 text-gray-500">
             {report.issues.length === 0
-              ? 'No issues found — your data looks great!'
+              ? 'No issues found. Your data looks great!'
               : 'No issues match the current filter.'}
           </div>
         ) : (
@@ -228,7 +249,7 @@ export default function ValidationStep({
               issue={issue}
               expanded={expandedIds.has(issue.id)}
               onToggleExpand={() => toggleExpand(issue.id)}
-              onDismiss={issue.dismissable ? () => dismissIssue(issue.id) : undefined}
+              onDismiss={issue.dismissable ? () => dismissIssue(issue) : undefined}
             />
           ))
         )}
@@ -237,7 +258,7 @@ export default function ValidationStep({
       {/* Action buttons */}
       <div className="flex justify-between mt-8">
         <Button variant="secondary" onClick={onBack}>Back to Metadata</Button>
-        <Button variant="primary" onClick={onContinue} disabled={activeErrors > 0}>
+        <Button variant="primary" onClick={() => onContinue(report?.issues.filter(i => dismissedIds.has(i.id)) ?? [])} disabled={activeErrors > 0}>
           {activeErrors > 0
             ? `Fix ${activeErrors} Error${activeErrors !== 1 ? 's' : ''} to Continue`
             : 'Continue to Export'}

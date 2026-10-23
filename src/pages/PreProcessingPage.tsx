@@ -62,7 +62,7 @@ function OSTabs({ active, onChange }: { active: OS; onChange: (os: OS) => void }
           <button
             key={opt.id}
             onClick={() => onChange(opt.id)}
-            className="text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+            className="btn-cta text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
             style={{
               backgroundColor: isActive ? PENN_BLUE : 'rgba(1,31,91,0.06)',
               color: isActive ? '#ffffff' : PENN_BLUE,
@@ -178,7 +178,7 @@ export default function PreProcessingPage() {
   const dcmInstall: Record<OS, string> = {
     macos: '# Recommended: Homebrew\nbrew install dcm2niix\n\n# Verify install\ndcm2niix --version',
     windows:
-      '# Option A: Chocolatey\nchoco install dcm2niix\n\n# Option B: Download prebuilt binary\n# https://github.com/rordenlab/dcm2niix/releases\n# Extract and add the folder containing dcm2niix.exe to your PATH\n\n# Verify install (PowerShell)\ndcm2niix --version',
+      '# Download the prebuilt Windows binary (dcm2niix_win.zip)\n# https://github.com/rordenlab/dcm2niix/releases\n# Extract it and add the folder containing dcm2niix.exe to your PATH\n\n# Verify install (PowerShell)\ndcm2niix --version',
     linux:
       '# Debian / Ubuntu\nsudo apt update\nsudo apt install dcm2niix\n\n# RHEL / Fedora\nsudo dnf install dcm2niix\n\n# Verify install\ndcm2niix --version',
     conda:
@@ -188,13 +188,13 @@ export default function PreProcessingPage() {
   // ── pydeface install commands per OS ────────────────────────
   const pydefaceInstall: Record<OS, string> = {
     macos:
-      '# 1. Install FSL (FLIRT is required by pydeface)\n#    See: https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation\n\n# 2. Install pydeface\npython -m pip install pydeface\n\n# Verify install\npydeface --help',
+      '# 1. Install FSL (FLIRT is required by pydeface)\n#    See: https://fsl.fmrib.ox.ac.uk/fsl/docs/#/install/index\n\n# 2. Install pydeface\npython -m pip install pydeface\n\n# Verify install\npydeface --help',
     windows:
       '# pydeface depends on FSL FLIRT, which does not run natively on Windows.\n# Use Windows Subsystem for Linux (WSL) and follow the Linux instructions below.\n\nwsl --install\n# After WSL reboot, open Ubuntu and run the Linux install steps.',
     linux:
-      '# 1. Install FSL\n#    See: https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation\n\n# 2. Install pydeface\npython -m pip install pydeface\n\n# Verify install\npydeface --help',
+      '# 1. Install FSL\n#    See: https://fsl.fmrib.ox.ac.uk/fsl/docs/#/install/index\n\n# 2. Install pydeface\npython -m pip install pydeface\n\n# Verify install\npydeface --help',
     conda:
-      '# Create a clean env with FSL + pydeface\nconda create -n deface -c conda-forge fsl pydeface python=3.11\nconda activate deface\n\n# Verify install\npydeface --help',
+      '# FSL is not on conda-forge: install it with the official FSL installer\n#    See: https://fsl.fmrib.ox.ac.uk/fsl/docs/#/install/index\n\n# Then install pydeface into a conda env\nconda create -n deface python=3.11\nconda activate deface\npython -m pip install pydeface\n\n# Verify install\npydeface --help',
   };
 
   return (
@@ -206,17 +206,18 @@ export default function PreProcessingPage() {
           <h1 className="text-3xl font-bold text-gray-900 mt-4 leading-tight">
             Convert and de-identify
             <br />
-            before you upload.
+            before you open NeuroGate.
           </h1>
           <p className="mt-4 text-sm text-gray-500 leading-relaxed max-w-lg">
-            NeuroGate expects BIDS-ready NIfTI files with all identifying facial features removed.
-            These two open-source tools, dcm2niix and pydeface, handle that step. Install them once,
-            then run them on every dataset before opening the NeuroGate Tool.
+            NeuroGate expects imaging as NIfTI files with JSON sidecars, with facial features removed
+            from structural MRI. These open-source tools handle that step: dcm2niix for MRI and CT,
+            PET2BIDS for PET, and pydeface for defacing. Install them once, then run them on every
+            dataset before opening it in NeuroGate. NeuroGate itself does not convert or deface.
           </p>
           <div className="mt-6 flex items-center gap-3">
             <Link
               to="/tool"
-              className="no-underline inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all"
+              className="btn-cta no-underline inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all"
               style={{ backgroundColor: PENN_BLUE, color: '#ffffff' }}
               onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = PENN_BLUE_HOVER)}
               onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = PENN_BLUE)}
@@ -229,7 +230,7 @@ export default function PreProcessingPage() {
             </Link>
             <Link
               to="/docs/sop-bids"
-              className="no-underline inline-flex items-center px-5 py-2 rounded-lg text-sm font-medium border transition-all"
+              className="btn-cta no-underline inline-flex items-center px-5 py-2 rounded-lg text-sm font-medium border transition-all"
               style={{ borderColor: '#d1d5db', color: '#374151' }}
               onMouseEnter={(e) => (e.currentTarget.style.borderColor = PENN_BLUE)}
               onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#d1d5db')}
@@ -240,8 +241,8 @@ export default function PreProcessingPage() {
         </div>
         <div className="flex items-end md:justify-end">
           <div className="md:text-right">
-            <div className="text-3xl font-bold" style={{ color: PENN_BLUE }}>2</div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide mt-1">Required tools</div>
+            <div className="text-3xl font-bold" style={{ color: PENN_BLUE }}>3</div>
+            <div className="text-xs text-gray-500 uppercase tracking-wide mt-1">Open-source tools</div>
           </div>
         </div>
       </div>
@@ -280,9 +281,10 @@ export default function PreProcessingPage() {
           ))}
         </div>
         <div className="mt-5 pt-4 border-t border-gray-100 text-xs text-gray-500 leading-relaxed">
-          The two highlighted steps run on your local machine before files reach NeuroGate.
+          The two highlighted steps run on your local machine before you open the files in NeuroGate.
           The governance framework (GOV-001) requires both DICOM-to-NIfTI conversion and facial
-          de-identification before any image leaves your site.
+          de-identification before any image leaves your site. For PET, convert with PET2BIDS
+          (below) instead of plain dcm2niix.
         </div>
       </div>
 
@@ -310,7 +312,7 @@ export default function PreProcessingPage() {
 
         <WhatWhy
           what="A small command-line tool by Chris Rorden that reads a folder of DICOM files and writes one .nii.gz volume per series, plus a .json sidecar with acquisition parameters that BIDS validators read."
-          why="BIDS only accepts NIfTI; it does not accept raw DICOM. Without dcm2niix you cannot produce a valid BIDS dataset, and NeuroGate will reject the upload."
+          why="BIDS only accepts NIfTI; it does not accept raw DICOM. Without dcm2niix you cannot produce a valid BIDS dataset: NeuroGate flags DICOM files and leaves them out of the export."
         />
 
         {/* Install */}
@@ -328,7 +330,7 @@ dcm2niix \\
   -z y \\
   -b y \\
   -ba y \\
-  -f "sub-%i_ses-%j_%p" \\
+  -f "%p_%s" \\
   -o /path/to/output/nifti \\
   /path/to/input/dicom`}</CodeBlock>
         </div>
@@ -348,8 +350,8 @@ dcm2niix \\
               <tbody className="bg-white">
                 <FlagRow flag="-z" value="y" desc="gzip the NIfTI output (.nii.gz), the BIDS-expected format. If omitted, NeuroGate compresses the .nii for you on export." />
                 <FlagRow flag="-b" value="y" desc="emit the .json sidecar with acquisition metadata." />
-                <FlagRow flag="-ba" value="y" desc="anonymize the sidecar by stripping PHI fields like PatientName." />
-                <FlagRow flag="-f" value='"sub-%i_ses-%j_%p"' desc="filename template; %i = patient ID, %j = study UID slug, %p = protocol name." />
+                <FlagRow flag="-ba" value="y" desc="anonymize the sidecar: strips dates and identifying fields like PatientName (the dcm2niix default)." />
+                <FlagRow flag="-f" value='"%p_%s"' desc="filename template; %p = protocol name, %s = series number. Never use %i or %n: they put the patient ID or name into the filename." />
                 <FlagRow flag="-o" value="<dir>" desc="output directory; one .nii.gz + .json per series." />
                 <FlagRow flag="-v" value="2" desc="verbose mode; useful when troubleshooting unrecognized series." />
               </tbody>
@@ -376,6 +378,288 @@ dcm2niix \\
         </div>
       </section>
 
+      {/* ═══ SCANNER-AWARE CONVERSION ══════════════════════ */}
+      <section
+        id="scanner-aware"
+        className="rounded-2xl border border-gray-100 bg-white p-8 shadow-sm mb-10"
+      >
+        <div className="flex items-start gap-4 mb-6">
+          <div
+            className="flex-shrink-0 w-14 h-14 rounded-xl flex items-center justify-center"
+            style={{ backgroundColor: 'rgba(124,58,237,0.08)' }}
+          >
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83" />
+            </svg>
+          </div>
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full" style={{ backgroundColor: 'rgba(124,58,237,0.08)', color: '#7c3aed' }}>
+                STEP 2b
+              </span>
+              <span className="text-[10px] font-medium px-2 py-0.5 rounded-full" style={{ backgroundColor: 'rgba(1,31,91,0.06)', color: PENN_BLUE }}>
+                Scanner-Aware Flags
+              </span>
+            </div>
+            <h2 className="text-2xl font-bold text-gray-900">Field-strength and manufacturer tuning</h2>
+            <p className="mt-1 text-sm text-gray-500 leading-relaxed">
+              dcm2niix works across all scanners, but the default command is not always correct for 3T vs. 7T
+              or across manufacturers. Different field strengths and vendor DICOM encodings require specific flags
+              to avoid missing slice timing, merged volumes, or incorrect intensity scaling.
+            </p>
+          </div>
+        </div>
+
+        {/* Why it matters */}
+        <div className="rounded-xl p-5 mb-8 border border-gray-100" style={{ backgroundColor: 'rgba(124,58,237,0.04)' }}>
+          <div className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: '#7c3aed' }}>Known problem</div>
+          <p className="text-xs text-gray-600 leading-relaxed">
+            Generic dcm2niix commands from public tutorials frequently fail or produce silent errors when used with
+            7T scanners (especially Siemens Terra on XA30 firmware), Philips scanners, or multiband fMRI sequences.
+            Symptoms include: missing SliceTiming in the JSON sidecar, incorrect volume counts in 4D fMRI files,
+            intensity rescaling artifacts in MP2RAGE images, and merged slices from enhanced DICOM files.
+            The automation script below detects these conditions from your DICOM headers and applies the right flags automatically.
+          </p>
+        </div>
+
+        {/* Issues-by-scanner table */}
+        <h3 className="text-sm font-semibold text-gray-900 mb-3">Common issues by scanner and field strength</h3>
+        <div className="rounded-xl border border-gray-100 overflow-auto mb-8">
+          <table className="w-full text-left min-w-[640px]">
+            <thead style={{ backgroundColor: 'rgba(124,58,237,0.05)' }}>
+              <tr>
+                <th className="text-[10px] font-bold uppercase tracking-widest text-gray-500 py-2.5 px-4">Scanner</th>
+                <th className="text-[10px] font-bold uppercase tracking-widest text-gray-500 py-2.5 px-4">Field</th>
+                <th className="text-[10px] font-bold uppercase tracking-widest text-gray-500 py-2.5 px-4">Known issue</th>
+                <th className="text-[10px] font-bold uppercase tracking-widest text-gray-500 py-2.5 px-4">Fix</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white text-xs text-gray-600">
+              {[
+                ['Siemens (XA30 firmware)', '3T / 7T', 'Enhanced DICOM packs all slices into one file; dcm2niix may merge volumes incorrectly', <><code className="font-mono px-1 rounded" style={{ backgroundColor: 'rgba(124,58,237,0.07)', color: '#7c3aed' }}>-m n</code> disables slice merging</>],
+                ['Siemens 7T Terra', '7T', 'Multiband (SMS) SliceTiming encoded in CSA private header; trigger-time glitches can corrupt it', <><code className="font-mono px-1 rounded" style={{ backgroundColor: 'rgba(124,58,237,0.07)', color: '#7c3aed' }}>--ignore_trigger_times</code> + verify JSON output</>],
+                ['Siemens 7T (MP2RAGE)', '7T', 'INV1, INV2, UNI-Images, and T1map produced as derived series; -i y would discard them', <><code className="font-mono px-1 rounded" style={{ backgroundColor: 'rgba(124,58,237,0.07)', color: '#7c3aed' }}>-i n</code> keeps derived images (also the default)</>],
+                ['Philips (all)', '3T / 7T', 'Intensity scaling is stored in private tags; display scaling distorts quantitative values', <><code className="font-mono px-1 rounded" style={{ backgroundColor: 'rgba(124,58,237,0.07)', color: '#7c3aed' }}>-p y</code> precise float scaling (also the default)</>],
+                ['Philips fMRI', '3T / 7T', 'SliceTiming not always embedded in DICOM; may be absent from JSON sidecar', 'Obtain timing from MR physicist if missing from sidecar; add manually'],
+                ['GE (older firmware)', '3T', 'One DICOM file per volume', 'No extra flag: dcm2niix stacks files from one series into a 4D volume. Check the volume count in the output'],
+                ['GE fMRI', '3T', 'SliceTiming not stored in standard DICOM tags on some GE sequences', 'Verify with scanner operator; add manually to JSON if absent'],
+                ['All scanners', '7T', 'B0 inhomogeneity is significantly higher; field maps become mandatory (not optional)', 'Always convert fmap/ series; set IntendedFor in field map JSON'],
+              ].map(([scanner, field, issue, fix], i) => (
+                <tr key={i} className="border-t border-gray-100">
+                  <td className="py-2.5 px-4 font-medium text-gray-800">{scanner}</td>
+                  <td className="py-2.5 px-4 whitespace-nowrap">{field}</td>
+                  <td className="py-2.5 px-4 leading-relaxed">{issue}</td>
+                  <td className="py-2.5 px-4 leading-relaxed">{fix}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Automation script */}
+        <h3 className="text-sm font-semibold text-gray-900 mb-1">Automation script</h3>
+        <p className="text-xs text-gray-500 mb-4 leading-relaxed">
+          The NeuroGate automation script reads your DICOM headers before calling dcm2niix,
+          detects the manufacturer (Siemens, GE or Philips), field strength and MRI sequence type, then applies the matching flags.
+          It also adds the required TaskName field to fMRI sidecars and checks the key required sidecar fields. It is for MRI; use PET2BIDS for PET.
+        </p>
+        <CodeBlock label="Install dependency + run">{`# Install once
+pip install pydicom
+
+# Run on a single DICOM series folder
+python convert_dicom_auto.py /path/to/dicoms/T1_MPRAGE/ /path/to/output/ \\
+    --subject PENN001 --session preimplant
+
+# Run for an fMRI series (adds TaskName to sidecar automatically)
+python convert_dicom_auto.py /path/to/dicoms/BOLD_rest/ /path/to/output/ \\
+    --subject PENN001 --session preimplant --task rest
+
+# Dry run: print the command without executing
+python convert_dicom_auto.py /path/to/dicoms/T1/ /path/to/output/ \\
+    --subject PENN001 --dry-run
+
+# Batch: convert all series folders for a subject
+for series_dir in /data/sub-PENN001/dicoms/*/; do
+  python convert_dicom_auto.py "$series_dir" /data/sub-PENN001/nifti/ \\
+      --subject PENN001 --session preimplant
+done`}</CodeBlock>
+        <div className="mt-3">
+          <a
+            href="/docs/convert_dicom_auto.py"
+            download
+            className="inline-flex items-center gap-2 text-xs font-medium no-underline"
+            style={{ color: '#7c3aed' }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            Download convert_dicom_auto.py
+          </a>
+        </div>
+
+        {/* fMRI-specific guidance */}
+        <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-5">
+          <div className="rounded-xl p-5 border border-gray-100" style={{ backgroundColor: 'rgba(1,31,91,0.04)' }}>
+            <div className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: PENN_BLUE }}>fMRI (BOLD)</div>
+            <p className="text-xs text-gray-600 leading-relaxed">
+              fMRI conversion requires SliceTiming in the JSON sidecar for motion correction pipelines (fMRIPrep, FSL FEAT).
+              On Siemens, dcm2niix extracts this from the private CSA header automatically. On Philips and GE it may be
+              absent. The automation script flags missing SliceTiming and prompts you to add it manually.
+              TaskName (e.g., <code className="font-mono">rest</code>) must also be injected; the script does this automatically.
+            </p>
+          </div>
+          <div className="rounded-xl p-5 border border-gray-100" style={{ backgroundColor: 'rgba(109,211,206,0.10)' }}>
+            <div className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: TEAL_TEXT }}>7T structural (MP2RAGE)</div>
+            <p className="text-xs text-gray-600 leading-relaxed">
+              7T Siemens scanners typically use MP2RAGE instead of MPRAGE for T1w. dcm2niix produces four volumes:
+              INV1, INV2, UNI-Images (the usable T1w), and T1map. Rename the UNI-Images output to
+              <code className="font-mono ml-1">_T1w.nii.gz</code> for BIDS compliance. Field maps are mandatory
+              at 7T and must include IntendedFor pointing to all BOLD and DWI series.
+            </p>
+          </div>
+        </div>
+
+        {/* Manual commands for each scanner type */}
+        <div className="mt-8">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Manual commands by scanner type</h3>
+          <div className="space-y-5">
+            <div>
+              <div className="text-xs font-semibold text-gray-700 mb-2">Siemens 3T (Prisma / Skyra): structural</div>
+              <CodeBlock>{`dcm2niix -z y -b y -ba y -v 2 \\
+  -f "%p_%s" \\
+  -o /output/anat/ \\
+  /input/dicom/T1_MPRAGE/`}</CodeBlock>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-gray-700 mb-2">Siemens 7T (Terra XA30): structural (MP2RAGE)</div>
+              <CodeBlock>{`# -m n: handle enhanced DICOM (all slices in one file)
+# -i n: keep derived images (INV1, INV2, UNI, T1map)
+dcm2niix -z y -b y -ba y -v 2 -m n -i n \\
+  -f "%p_%s" \\
+  -o /output/anat/ \\
+  /input/dicom/MP2RAGE/`}</CodeBlock>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-gray-700 mb-2">Siemens 3T / 7T: fMRI (BOLD, multiband)</div>
+              <CodeBlock>{`# --ignore_trigger_times: prevents clock glitches corrupting SliceTiming
+# -m n: required for XA30 enhanced DICOM
+dcm2niix -z y -b y -ba y -v 2 -m n --ignore_trigger_times \\
+  -f "%p_%s" \\
+  -o /output/func/ \\
+  /input/dicom/BOLD_rest/
+
+# Inject TaskName into JSON after conversion (dcm2niix does not add this)
+python -c "
+import json, pathlib
+for p in pathlib.Path('/output/func/').glob('*.json'):
+    d = json.loads(p.read_text())
+    if 'RepetitionTime' in d and 'TaskName' not in d:
+        d['TaskName'] = 'rest'
+        p.write_text(json.dumps(d, indent=2))
+        print('Patched', p.name)
+"`}</CodeBlock>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-gray-700 mb-2">Philips 3T / 7T: all modalities</div>
+              <CodeBlock>{`# -p y: precise float scaling (critical for MP2RAGE, ASL)
+dcm2niix -z y -b y -ba y -v 2 -p y \\
+  -f "%p_%s" \\
+  -o /output/ \\
+  /input/dicom/`}</CodeBlock>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-gray-700 mb-2">GE 3T: fMRI</div>
+              <CodeBlock>{`# Older GE firmware writes one DICOM per volume; dcm2niix stacks them
+# into one 4D file automatically. Check the volume count afterwards.
+dcm2niix -z y -b y -ba y -v 2 \\
+  -f "%p_%s" \\
+  -o /output/func/ \\
+  /input/dicom/BOLD_rest/`}</CodeBlock>
+            </div>
+          </div>
+        </div>
+
+        {/* Verify step */}
+        <div className="mt-8 rounded-xl p-5" style={{ backgroundColor: 'rgba(124,58,237,0.05)' }}>
+          <div className="flex items-start gap-3">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0 mt-0.5">
+              <polyline points="9 11 12 14 22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
+            <div>
+              <div className="text-sm font-semibold text-gray-900">Post-conversion verification checklist</div>
+              <ul className="text-xs text-gray-600 mt-2 leading-relaxed space-y-1 list-none">
+                <li>&#x2713;&nbsp; JSON sidecar exists alongside every .nii.gz file</li>
+                <li>&#x2713;&nbsp; <code className="font-mono">MagneticFieldStrength</code> matches your scanner (3 or 7)</li>
+                <li>&#x2713;&nbsp; fMRI sidecar contains <code className="font-mono">SliceTiming</code> array with one value per slice</li>
+                <li>&#x2713;&nbsp; fMRI sidecar contains <code className="font-mono">TaskName</code></li>
+                <li>&#x2713;&nbsp; <code className="font-mono">PatientName</code>, <code className="font-mono">PatientID</code>, <code className="font-mono">PatientBirthDate</code> are absent from all sidecars</li>
+                <li>&#x2713;&nbsp; 4D fMRI volume count matches expected number of time points</li>
+                <li>&#x2713;&nbsp; 7T field map JSON contains <code className="font-mono">IntendedFor</code> pointing to all BOLD and DWI files</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ═══ PET: PET2BIDS (dcm2niix4pet) ═════════════════════ */}
+      <section
+        id="pet2bids"
+        className="rounded-2xl border border-gray-100 bg-white p-8 shadow-sm mb-10"
+      >
+        <ToolHeader
+          badge="STEP 2 · PET"
+          name="PET2BIDS (dcm2niix4pet)"
+          tagline="Convert PET DICOM to NIfTI with a complete BIDS PET sidecar: tracer, injected dose, timing and reconstruction."
+          tagColor={PENN_BLUE}
+          tagBg="rgba(1,31,91,0.08)"
+          iconColor={PENN_BLUE}
+          homepage="https://github.com/openneuropet/PET2BIDS"
+          icon={
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke={PENN_BLUE} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <circle cx="12" cy="12" r="7" />
+              <circle cx="12" cy="12" r="10" />
+            </svg>
+          }
+        />
+
+        <WhatWhy
+          what="dcm2niix4pet runs dcm2niix on a PET series, then fills the BIDS-required PET sidecar fields from the DICOM headers. Values the headers don't contain can be supplied with --kwargs."
+          why="Plain dcm2niix writes only some PET fields (tracer, radionuclide, injected dose, units) and none of the timing fields BIDS requires, such as TimeZero, ScanStart and InjectionStart. NeuroGate recognizes PET either way, but warns about every missing required field."
+        />
+
+        <div className="mt-8">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Install</h3>
+          <CodeBlock>{`# Python 3; also needs dcm2niix (see above), v1.0.20220720 or newer
+python -m pip install pypet2bids
+
+# Verify install
+dcm2niix4pet --help`}</CodeBlock>
+        </div>
+
+        <div className="mt-8">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Quick start</h3>
+          <CodeBlock label="Convert one PET series">{`dcm2niix4pet /path/to/pet/dicom -d /path/to/output/pet
+
+# Supply values the DICOM headers don't carry, e.g. for FDG:
+dcm2niix4pet /path/to/pet/dicom -d /path/to/output/pet \\
+  --kwargs InjectedMass=n/a InjectedMassUnits=n/a \\
+  SpecificRadioactivity=n/a SpecificRadioactivityUnits=n/a \\
+  ModeOfAdministration=bolus`}</CodeBlock>
+        </div>
+
+        <div className="mt-6 rounded-lg p-3 text-xs leading-relaxed" style={{ backgroundColor: 'rgba(1,31,91,0.04)', color: '#374151' }}>
+          <span className="font-semibold">Also for PET:</span> Siemens HRRT ECAT files (.v) must be converted to NIfTI too;
+          PET2BIDS includes <code className="font-mono mx-1 px-1 rounded bg-gray-100">ecatpet2bids</code> for that.
+          The low-dose CT a PET/CT scanner takes for attenuation correction does not need to be kept: NeuroGate
+          recognizes it and leaves it out of the export. PET blood data (_blood.tsv) is not supported.
+        </div>
+      </section>
+
       {/* ═══ TOOL 2: pydeface ═══════════════════════════════ */}
       <section
         id="pydeface"
@@ -384,7 +668,7 @@ dcm2niix \\
         <ToolHeader
           badge="STEP 3"
           name="pydeface"
-          tagline="Remove facial features from T1w, T2w, and FLAIR images so subjects cannot be re-identified from a 3D render."
+          tagline="Remove facial features from T1w, T2w, FLAIR, PDw and T2*w images so subjects cannot be re-identified from a 3D render."
           tagColor={TEAL_TEXT}
           tagBg="rgba(109,211,206,0.16)"
           iconColor={TEAL_TEXT}
@@ -423,8 +707,8 @@ dcm2niix \\
           <CodeBlock label="Deface a single anatomical scan">{`# Produces sub-ID001_ses-01_T1w_defaced.nii.gz next to the input
 pydeface sub-ID001_ses-01_T1w.nii.gz
 
-# Loop over every T1w / T2w / FLAIR in a folder
-for f in *_T1w.nii.gz *_T2w.nii.gz *_FLAIR.nii.gz; do
+# Loop over every structural MRI in a folder
+for f in *_T1w.nii.gz *_T2w.nii.gz *_FLAIR.nii.gz *_PDw.nii.gz *_T2starw.nii.gz; do
   pydeface "$f"
 done`}</CodeBlock>
         </div>
@@ -465,7 +749,7 @@ done`}</CodeBlock>
               <p className="text-xs text-gray-600 mt-1 leading-relaxed">
                 Open every defaced volume in a 3D viewer (FSLeyes, ITK-SNAP, or Mango) and confirm the face region is zeroed
                 and that brain tissue, especially temporal lobes, is intact. NeuroGate's metadata step asks you to attest that
-                this QA was performed; the attestation is recorded in the ALCOA+ audit log.
+                all structural MRI has been defaced; the attestation is recorded in the audit log.
               </p>
             </div>
           </div>
@@ -484,17 +768,17 @@ done`}</CodeBlock>
               Why we require these two tools
             </h3>
             <p className="mt-3 text-sm leading-relaxed" style={{ color: 'rgba(255,255,255,0.7)' }}>
-              The Regulatory Governance Framework (GOV-001) defines two pre-upload obligations: any imaging
-              data leaving a site must be in an open, non-proprietary format (NIfTI), and any full-face anatomical
-              scan must have facial features removed. dcm2niix and pydeface are the open-source defaults the
-              project uses to satisfy both obligations. Sites are free to substitute equivalent tools, but the
-              attestation step in NeuroGate still requires a tool name and version for the audit trail.
+              The Regulatory Governance Framework (GOV-001) defines two obligations before any image leaves a
+              site: it must be in an open, non-proprietary format (NIfTI), and any structural MRI must have facial
+              features removed. dcm2niix, PET2BIDS and pydeface are the open-source defaults the project uses to
+              meet them. Sites may substitute equivalent tools; NeuroGate records that defacing was attested,
+              not which tool was used.
             </p>
           </div>
           <div className="flex md:justify-end">
             <Link
               to="/docs/gov-001"
-              className="no-underline inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all"
+              className="btn-cta no-underline inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all"
               style={{ backgroundColor: TEAL, color: PENN_BLUE }}
               onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#5bc4bf')}
               onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = TEAL)}

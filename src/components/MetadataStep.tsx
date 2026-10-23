@@ -1,10 +1,10 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import Button from './Button';
 import SubjectMetadataForm from './SubjectMetadataForm';
 import DatasetDescriptionForm from './DatasetDescriptionForm';
 import DefacingAttestation from './DefacingAttestation';
 import type { DetectionResult } from '../types/detection';
-import { getEffectiveSession, getEffectiveModality, getEffectiveSubjectGroup } from '../types/detection';
+import { getEffectiveSession, getEffectiveSubjectGroup, requiresDefacing } from '../types/detection';
 import type {
   SubjectMetadata,
   DatasetDescription,
@@ -19,20 +19,53 @@ import {
 } from '../types/metadata';
 import type { ScannedFile } from '../types/files';
 import { autoFillFromDroppedFiles } from '../lib/metadata';
+import { useAudit } from '../lib/audit';
+import type { DatasetStructure } from '../types/sessionStructure';
+import { createDefaultDatasetStructure, resolveSessionIds } from '../types/sessionStructure';
 
 interface MetadataStepProps {
   detectionResults: DetectionResult[];
   scannedFiles: ScannedFile[];
   onContinue: (metadata: MetadataOutput) => void;
-  onBack: () => void;
+  /** Called with what was entered so far, so it can be restored next time. */
+  onBack: (draft: MetadataDraft) => void;
+  /**
+   * Entries from an earlier visit to this step (Back to Mapping, or Back
+   * from Validate), restored instead of the defaults. The step is
+   * recreated on every visit, so without this everything typed was lost.
+   */
+  initialDraft?: MetadataDraft;
+  /** Called whenever an entry changes, so it can be saved and survive a reload. */
+  onDraftChange?: (draft: MetadataDraft) => void;
+  /** Active session structure; used to order sessions correctly for both presets. */
+  structure?: DatasetStructure;
 }
 
 /** Everything the metadata step produces */
-export interface MetadataOutput {
+export interface MetadataOutput extends MetadataDraft {
   subjects: SubjectMetadata[];
+}
+
+/**
+ * What the user typed on this step, kept between visits. Subjects aren't
+ * part of it: they're rebuilt from the mapping every time, since the user
+ * may have changed it.
+ */
+export interface MetadataDraft {
+  institutionConfig: InstitutionConfig;
   datasetDescription: DatasetDescription;
   defacingAttestation: DefacingAttestationType;
-  institutionConfig: InstitutionConfig;
+  /**
+   * The structural MRI files the attestation covered. If the mapping now
+   * gives a different set, the attestation no longer applies and must be
+   * confirmed again.
+   */
+  attestedFiles: string[];
+}
+
+/** The files a defacing attestation covers, as a stable list. */
+function defacedFileKey(results: DetectionResult[]): string[] {
+  return results.filter(requiresDefacing).map(r => r.relativePath).sort();
 }
 
 type TabId = 'institution' | 'subjects' | 'dataset' | 'defacing';
@@ -42,16 +75,71 @@ export default function MetadataStep({
   scannedFiles,
   onContinue,
   onBack,
+  initialDraft,
+  onDraftChange,
+  structure = createDefaultDatasetStructure(),
 }: MetadataStepProps) {
   const [activeTab, setActiveTab] = useState<TabId>('institution');
-  const [institutionConfig, setInstitutionConfig] = useState<InstitutionConfig>(createDefaultInstitutionConfig());
-  const [subjects, setSubjects] = useState<SubjectMetadata[]>([]);
-  const [datasetDescription, setDatasetDescription] = useState<DatasetDescription>(createDefaultDatasetDescription());
-  const [attestation, setAttestation] = useState<DefacingAttestationType>(createDefaultAttestation());
+  const [institutionConfig, setInstitutionConfig] = useState<InstitutionConfig>(
+    () => initialDraft?.institutionConfig ?? createDefaultInstitutionConfig(),
+  );
+  // Subjects as detected (groups + sessions). Their BIDS IDs are derived
+  // from the institution prefix and starting number below, so they always
+  // match the current Institution Setup without a state-syncing effect.
+  const [baseSubjects, setSubjects] = useState<SubjectMetadata[]>([]);
+  const [datasetDescription, setDatasetDescription] = useState<DatasetDescription>(
+    () => initialDraft?.datasetDescription ?? createDefaultDatasetDescription(),
+  );
+  // A restored attestation only stands if it still covers exactly the
+  // same structural MRI files.
+  const [attestation, setAttestation] = useState<DefacingAttestationType>(() => {
+    if (!initialDraft) return createDefaultAttestation();
+    const same = initialDraft.attestedFiles.join('\n') === defacedFileKey(detectionResults).join('\n');
+    return same ? initialDraft.defacingAttestation : createDefaultAttestation();
+  });
+
+  // The attestation is logged when it changes: ticked, unticked, or
+  // cleared on return because the structural MRI files changed.
+  const audit = useAudit();
+  const loggedDiscard = useRef(false);
+  useEffect(() => {
+    if (loggedDiscard.current || !initialDraft?.defacingAttestation.confirmed || attestation.confirmed) return;
+    loggedDiscard.current = true;
+    audit.logDefacingRevoked('files-changed');
+    // Runs once, on entering the step with a draft whose attestation didn't carry over.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const updateAttestation = (next: DefacingAttestationType) => {
+    if (next.confirmed && !attestation.confirmed) audit.logDefacingAttested(defacedFileKey(detectionResults).length);
+    if (!next.confirmed && attestation.confirmed) audit.logDefacingRevoked('unticked');
+    setAttestation(next);
+  };
+
+  // Report the entries as they change, so a reload can bring them back.
+  useEffect(() => {
+    onDraftChange?.({ institutionConfig, datasetDescription, defacingAttestation: attestation, attestedFiles: defacedFileKey(detectionResults) });
+    // Only the entries themselves trigger a report.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [institutionConfig, datasetDescription, attestation]);
   const [autoFilledSubjects, setAutoFilledSubjects] = useState<Set<string>>(new Set());
   const [showErrors, setShowErrors] = useState(false);
   const [autoFilledDataset, setAutoFilledDataset] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+
+  // ── Infer institution prefix from file/folder names ──────────
+  const inferredPrefix = useMemo(() => {
+    const names = scannedFiles.map(f => f.relativePath || f.name);
+    // Look for known patterns: sub-XXX, HUP###, or leading uppercase word
+    for (const name of names) {
+      // BIDS sub- prefix: sub-SITE### -> extract SITE
+      const bids = name.match(/sub-([A-Z]{2,6})\d*/);
+      if (bids) return bids[1];
+      // Bare institution code at start of filename: HUP282, CHOP001, etc.
+      const bare = name.match(/(?:^|\/)([A-Z]{2,6})\d+/);
+      if (bare) return bare[1];
+    }
+    return null;
+  }, [scannedFiles]);
 
   // ── Derive subject groups and sessions from detection results ──
   const subjectData = useMemo(() => {
@@ -72,12 +160,7 @@ export default function MetadataStep({
   }, [detectionResults]);
 
   // ── Check if structural MRIs exist (for defacing attestation) ──
-  const hasStructuralMri = useMemo(() => {
-    return detectionResults.some(r => {
-      const mod = getEffectiveModality(r);
-      return mod === 'anat-T1w' || mod === 'anat-T2w' || mod === 'anat-FLAIR';
-    });
-  }, [detectionResults]);
+  const hasStructuralMri = useMemo(() => detectionResults.some(requiresDefacing), [detectionResults]);
 
   // ── Initialize subjects and try auto-fill on mount ────────────
   useEffect(() => {
@@ -98,7 +181,7 @@ export default function MetadataStep({
       }
 
       // Try auto-fill from dropped files
-      const autoFilled = await autoFillFromDroppedFiles(scannedFiles, filesByGroup);
+      const autoFilled = await autoFillFromDroppedFiles(scannedFiles, filesByGroup, resolveSessionIds(structure));
 
       // Track which subjects were auto-filled
       const filledSet = new Set<string>();
@@ -107,8 +190,9 @@ export default function MetadataStep({
       }
       setAutoFilledSubjects(filledSet);
 
-      // Pre-fill dataset description if found
-      if (autoFilled.datasetDescription) {
+      // Pre-fill dataset description if found, but never over what the
+      // user already entered on an earlier visit.
+      if (autoFilled.datasetDescription && !initialDraft) {
         setDatasetDescription(prev => ({
           ...prev,
           ...autoFilled.datasetDescription,
@@ -129,14 +213,15 @@ export default function MetadataStep({
           // Try to get auto-filled data for this session
           const autoSession = autoSessions?.find(s => s.sessionId === sessionId);
           sessions.push({
-            sessionId: sessionId as any,
+            sessionId: sessionId as SessionMetadata['sessionId'],
             acqTime: autoSession?.acqTime || '',
             age: autoSession?.age || '',
           });
         }
 
-        // Sort sessions in clinical order
-        const sessionOrder = ['ses-preimplant', 'ses-postimplant', 'ses-postsurgery'];
+        // Sort sessions in the dataset's defined order (clinical order for
+        // Implant sessions, chronological order for Custom timepoints).
+        const sessionOrder = resolveSessionIds(structure);
         sessions.sort((a, b) =>
           sessionOrder.indexOf(a.sessionId) - sessionOrder.indexOf(b.sessionId)
         );
@@ -159,18 +244,12 @@ export default function MetadataStep({
     init();
   }, []); // Run once on mount
 
-  // ── Regenerate BIDS IDs when institution config changes ───────
-  useEffect(() => {
-    if (isLoading) return;
-    setSubjects(prev => prev.map((subject, i) => {
-      const prefix = institutionConfig.prefix || 'SITE';
-      const paddedNum = String(institutionConfig.startingNumber + i).padStart(3, '0');
-      return {
-        ...subject,
-        bidsSubjectId: `sub-${prefix}${paddedNum}`,
-      };
-    }));
-  }, [institutionConfig.prefix, institutionConfig.startingNumber, isLoading]);
+  // ── BIDS IDs follow the institution config ─────────────────────
+  const subjects = useMemo(() => baseSubjects.map((subject, i) => {
+    const prefix = institutionConfig.prefix || 'SITE';
+    const paddedNum = String(institutionConfig.startingNumber + i).padStart(3, '0');
+    return { ...subject, bidsSubjectId: `sub-${prefix}${paddedNum}` };
+  }), [baseSubjects, institutionConfig.prefix, institutionConfig.startingNumber]);
 
   // ── Update a single subject ───────────────────────────────────
   const updateSubject = (index: number, updated: SubjectMetadata) => {
@@ -213,6 +292,19 @@ export default function MetadataStep({
     { id: 'defacing', label: 'Defacing Attestation' },
   ];
 
+  // ── Per-tab completion, so users can see at a glance which of the
+  // 4 sections still need attention instead of only finding out via the
+  // validation error banner after pressing Continue. Testers were filling
+  // in Institution Setup, pressing Continue, and not realizing there were
+  // 3 more sections reachable only via these tabs. ──────────────────
+  const tabComplete: Record<TabId, boolean> = {
+    institution: !!institutionConfig.prefix && /^[A-Z]{2,6}$/.test(institutionConfig.prefix),
+    subjects: subjects.length > 0,
+    dataset: !!datasetDescription.name.trim() && datasetDescription.authors.some(a => a.trim()),
+    defacing: !hasStructuralMri || attestation.confirmed,
+  };
+  const completedCount = tabs.filter(t => tabComplete[t.id]).length;
+
   if (isLoading) {
     return (
       <div className="flex flex-col items-center justify-center py-24">
@@ -224,26 +316,50 @@ export default function MetadataStep({
 
   return (
     <div className="w-full max-w-4xl mx-auto">
+      {/* Progress hint: makes it explicit up front that there are 4
+          sections to visit via the tabs below, not just the one currently
+          showing -- addresses testers who filled Institution Setup, hit
+          Continue, and didn't realize the other tabs still needed input. */}
+      <div className="flex items-center justify-between mb-2 px-0.5">
+        <p className="text-xs font-medium text-gray-500">
+          {completedCount} of {tabs.length} sections complete
+        </p>
+        {completedCount < tabs.length && (
+          <p className="text-xs text-amber-600 font-medium">
+            Visit each tab below to finish
+          </p>
+        )}
+      </div>
+
       {/* Tab navigation */}
       <div className="flex border-b border-gray-200 mb-6">
-        {tabs.map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`px-5 py-3 text-sm font-medium border-b-2 transition-colors ${
-              activeTab === tab.id
-                ? 'border-[#011F5B] text-[#011F5B]'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            }`}
-          >
-            {tab.label}
-            {tab.count !== undefined && (
-              <span className="ml-1.5 text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">
-                {tab.count}
-              </span>
-            )}
-          </button>
-        ))}
+        {tabs.map(tab => {
+          const complete = tabComplete[tab.id];
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`btn-cta flex items-center gap-1.5 px-5 py-3 text-sm font-medium border-b-2 transition-colors ${
+                activeTab === tab.id
+                  ? 'border-[#011F5B] text-[#011F5B]'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              }`}
+            >
+              <span
+                className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                  complete ? 'bg-emerald-500' : 'bg-amber-400'
+                }`}
+                aria-hidden="true"
+              />
+              {tab.label}
+              {tab.count !== undefined && (
+                <span className="ml-0.5 text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">
+                  {tab.count}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       {/* Tab content */}
@@ -271,7 +387,7 @@ export default function MetadataStep({
                     ...prev,
                     prefix: e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6),
                   }))}
-                  placeholder="e.g., CHOP, PENN, HUP"
+                  placeholder={inferredPrefix ? `e.g., ${inferredPrefix}` : 'Institution prefix'}
                   maxLength={6}
                   className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2
                     hover:border-gray-400 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none
@@ -342,6 +458,7 @@ export default function MetadataStep({
                     subject={subject}
                     onUpdate={(updated) => updateSubject(i, updated)}
                     autoFilled={autoFilledSubjects.has(subject.subjectGroup)}
+                    isSingleSession={structure.presetId === 'single-session'}
                   />
                 ))}
               </>
@@ -362,7 +479,7 @@ export default function MetadataStep({
         {activeTab === 'defacing' && (
           <DefacingAttestation
             attestation={attestation}
-            onUpdate={setAttestation}
+            onUpdate={updateAttestation}
             hasStructuralMri={hasStructuralMri}
           />
         )}
@@ -385,7 +502,17 @@ export default function MetadataStep({
 
       {/* Action buttons */}
       <div className="flex justify-between mt-6">
-        <Button variant="secondary" onClick={onBack}>Back to Mapping</Button>
+        <Button
+          variant="secondary"
+          onClick={() => onBack({
+            institutionConfig,
+            datasetDescription,
+            defacingAttestation: attestation,
+            attestedFiles: defacedFileKey(detectionResults),
+          })}
+        >
+          Back to Mapping
+        </Button>
         <Button
           variant="primary"
           onClick={() => {
@@ -397,6 +524,7 @@ export default function MetadataStep({
                 datasetDescription,
                 defacingAttestation: attestation,
                 institutionConfig,
+                attestedFiles: defacedFileKey(detectionResults),
               });
             }
           }}

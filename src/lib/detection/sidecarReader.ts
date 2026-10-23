@@ -33,12 +33,110 @@ const SCAN_NAME_FIELDS = [
   'ImageType',
 ];
 
+/**
+ * Date fields dcm2niix may write into a sidecar, in preference order.
+ * AcquisitionDateTime is most precise (includes time-of-day, usually an
+ * ISO-ish string); StudyDate and SeriesDate are DICOM-format plain dates
+ * (YYYYMMDD, no separators, no time). Used by the Custom timepoints
+ * date-cluster detector (dateClusterDetector.ts) -- not currently used
+ * for anything else. See
+ * Documents/Phase1b_Custom_Timepoint_Detection_Spec.md Section 4.
+ */
+// ScanDate: PET only. dcm2niix omits AcquisitionDateTime for PET, so a
+// PET sidecar written by PET2BIDS may carry its date only here.
+const DATE_FIELDS = ['AcquisitionDateTime', 'StudyDate', 'SeriesDate', 'ScanDate'];
+
+/**
+ * Parse a DICOM-derived date value into a real Date, handling both the
+ * ISO-ish AcquisitionDateTime strings dcm2niix writes and the plain
+ * YYYYMMDD strings used by StudyDate/SeriesDate. Returns null if the
+ * value isn't a usable date (missing, malformed, or clearly a
+ * de-identified placeholder like "19000101").
+ */
+function parseSidecarDate(value: unknown): Date | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const trimmed = value.trim();
+
+  // Plain DICOM date: YYYYMMDD (8 digits, no separators, no time).
+  if (/^\d{8}$/.test(trimmed)) {
+    const year = Number(trimmed.slice(0, 4));
+    const month = Number(trimmed.slice(4, 6));
+    const day = Number(trimmed.slice(6, 8));
+    if (year < 1990) return null; // de-identified placeholder (e.g. "19000101")
+    const date = new Date(year, month - 1, day);
+    if (isNaN(date.getTime())) return null;
+    // The Date(year, month, day) constructor silently rolls invalid
+    // calendar dates forward (e.g. Feb 30 -> Mar 2) instead of rejecting
+    // them. That would let a corrupted timestamp quietly shift a
+    // date-cluster assignment with no warning. Reject anything that
+    // didn't round-trip back to the exact date written. Found via
+    // adversarial testing 2026-08-02.
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+      return null;
+    }
+    return date;
+  }
+
+  // ISO-ish AcquisitionDateTime, e.g. "2026-05-27T14:32:00" or with offset.
+  const date = new Date(trimmed);
+  if (isNaN(date.getTime())) return null;
+  if (date.getFullYear() < 1990) return null;
+  return date;
+}
+
 /** What a paired sidecar tells us about a data file. */
 export interface SidecarInfo {
   /** Combined scan-name text pulled from the sidecar's descriptive fields. */
   scanText: string;
   /** The sidecar file name, used in audit / reason messages. */
   sidecarName: string;
+  /**
+   * The DICOM ImageType tag, kept as its own array rather than only being
+   * flattened into scanText.
+   *
+   * ImageType is the scanner's own structured statement of what an image
+   * is, and it is the only reliable way to tell a raw acquisition from a
+   * scanner-computed parameter map:
+   *
+   *   ['ORIGINAL','PRIMARY','DIFFUSION','NONE','ND','MOSAIC']  raw DWI
+   *   ['DERIVED', 'PRIMARY','DIFFUSION','ADC','ND']            ADC map
+   *   ['DERIVED', 'PRIMARY','DIFFUSION','FA','ND']             FA map
+   *   ['DERIVED', 'PRIMARY','DIFFUSION','TRACEW','ND']         trace-weighted
+   *
+   * Filename matching cannot substitute for this. dcm2niix frequently
+   * drops the descriptive suffix and numbers the output instead, so the
+   * ADC map of series 18 arrives as
+   * "_ep2d_diff_SliceAcc_b1k_64_20170130080338_18.nii.gz" -- a name that
+   * looks exactly like raw diffusion while its sidecar says
+   * DERIVED/ADC. Matching scanText does not work either: ImageType is
+   * concatenated with SeriesDescription and the sequence fields, so a
+   * suffix-anchored pattern never lines up. Verified against the
+   * Phase2_MRI corpus 2026-08-17.
+   */
+  imageType: string[];
+  /**
+   * Acquisition date parsed from AcquisitionDateTime / StudyDate /
+   * SeriesDate (first present, in that order). Null if none of those
+   * fields were present or parseable. Used only by the Custom timepoints
+   * date-cluster detector -- unrelated to the existing scan-name text
+   * matching this reader was originally built for.
+   */
+  acquisitionDate: Date | null;
+  /**
+   * The DICOM Modality the converter recorded, upper-cased ("MR", "CT",
+   * "PT" for PET, ...), or null if absent. dcm2niix writes it for every
+   * series. It's the scanner's own statement of what kind of image this
+   * is, so engine.ts trusts it over any name: it is how a PET series named
+   * "Brain_3D_OSEM_TOF" (TOF = time-of-flight, not MR angiography) or a
+   * CT named "PET_CT_Brain" is classified correctly.
+   */
+  dicomModality: string | null;
+  /** Every top-level key in the sidecar, for PET-only field detection and the PET completeness check. */
+  fieldNames: string[];
+  /** TracerName (BIDS) or Radiopharmaceutical (older dcm2niix / PET2BIDS), if present. */
+  tracerName: string | null;
+  /** Number of PET frames (length of FrameDuration), or null if absent. More than one = dynamic. */
+  frameCount: number | null;
 }
 
 /**
@@ -56,8 +154,22 @@ export function getSidecarBaseName(fileName: string): string {
 }
 
 /**
+ * Lookup key pairing a data file with its sidecar: the file's folder plus
+ * its base name. A sidecar only describes the scan sitting next to it, so
+ * the folder is part of the key. Keying by base name alone let
+ * "Patient_001/T1w.json" and "Patient_002/T1w.json" overwrite each other,
+ * so one subject's scans were classified (and dated) using another
+ * subject's sidecar.
+ */
+export function sidecarKey(relativePath: string): string {
+  const slash = relativePath.lastIndexOf('/');
+  const folder = slash === -1 ? '' : relativePath.slice(0, slash + 1);
+  return folder + getSidecarBaseName(relativePath.slice(slash + 1));
+}
+
+/**
  * Read every JSON sidecar in the dropped file set and return a map keyed
- * by base name (filename minus extension) -> extracted scan-name text.
+ * by sidecarKey() (folder + base name) -> extracted scan-name text.
  *
  * Sidecars are tiny (a few KB), so reading them all in parallel is cheap
  * even for large datasets. Malformed or unreadable JSON is skipped
@@ -87,11 +199,38 @@ export async function readJsonSidecars(
           }
         }
 
+        let acquisitionDate: Date | null = null;
+        for (const field of DATE_FIELDS) {
+          acquisitionDate = parseSidecarDate(parsed[field]);
+          if (acquisitionDate) break;
+        }
+
+        const rawImageType = parsed['ImageType'];
+        const imageType = Array.isArray(rawImageType)
+          ? rawImageType.filter((v): v is string => typeof v === 'string')
+          : [];
+
+        const rawModality = parsed['Modality'];
+        const dicomModality = typeof rawModality === 'string' && rawModality.trim()
+          ? rawModality.trim().toUpperCase()
+          : null;
+        const rawTracer = parsed['TracerName'] ?? parsed['Radiopharmaceutical'];
+        const tracerName = typeof rawTracer === 'string' && rawTracer.trim() ? rawTracer.trim() : null;
+        const rawFrames = parsed['FrameDuration'];
+        const frameCount = Array.isArray(rawFrames) ? rawFrames.length : null;
+        const fieldNames = Object.keys(parsed);
+
         const scanText = parts.join(' ').trim();
-        if (scanText) {
-          map.set(getSidecarBaseName(jf.name), {
+        if (scanText || acquisitionDate || imageType.length > 0 || dicomModality || fieldNames.length > 0) {
+          map.set(sidecarKey(jf.relativePath), {
             scanText,
             sidecarName: jf.name,
+            acquisitionDate,
+            imageType,
+            dicomModality,
+            fieldNames,
+            tracerName,
+            frameCount,
           });
         }
       } catch {

@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+/**
+ * Bundles src/lib/adapters/desktopExport.ts (TypeScript, reaching into
+ * src/lib for the Node export writer and de-identifiers) into a single
+ * CommonJS file, electron/desktop-export.cjs, that electron/main.cjs can
+ * require(). Same approach as build-cli-bundle.mjs, for the same reason:
+ * the main process is plain .cjs with no TypeScript build step.
+ *
+ * Must run before any Electron launch or package (electron:dev,
+ * electron:dev:fast, electron:build, and the release workflow).
+ */
+import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
+const { version } = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf-8'));
+
+build({
+  entryPoints: [join(ROOT, 'src', 'lib', 'adapters', 'desktopExport.ts')],
+  outfile: join(ROOT, 'electron', 'desktop-export.cjs'),
+  bundle: true,
+  platform: 'node',
+  target: 'node20',
+  format: 'cjs',
+  // See src/version.ts.
+  define: { __APP_VERSION__: JSON.stringify(version) },
+  minify: false,
+  sourcemap: false,
+  logLevel: 'info',
+}).catch((err) => {
+  console.error('[desktop:bundle] failed:', err);
+  process.exitCode = 1;
+});

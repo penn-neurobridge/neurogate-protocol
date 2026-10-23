@@ -10,16 +10,23 @@
  */
 
 import type { AuditLogger } from './auditLogger';
+import { redactAuditValue, type RedactionPairs } from './auditRedaction';
 
 // ── JSON Export ─────────────────────────────────────────────────
 
-export function exportAsJson(logger: AuditLogger, exportedBy: string): string {
-  const header = logger.getExportHeader(exportedBy);
+/**
+ * The audit log as JSON. With `redact`, the shareable copy: original file
+ * names, paths and subject-group names replaced (see auditRedaction.ts),
+ * and the operator shown only as "site".
+ */
+export function exportAsJson(logger: AuditLogger, exportedBy: string, redact?: RedactionPairs): string {
+  const header = logger.getExportHeader(redact ? 'site' : exportedBy);
   const log = logger.getLog();
 
   const output = {
     _format: 'ALCOA+ Audit Log',
     _version: '1.0',
+    ...(redact ? { _copy: 'Shareable copy: original file, folder and subject names are replaced with their exported BIDS names. The full log stays at the site.' } : {}),
     header,
     entries: log.entries.map(entry => ({
       id: entry.id,
@@ -31,7 +38,7 @@ export function exportAsJson(logger: AuditLogger, exportedBy: string): string {
     })),
   };
 
-  return JSON.stringify(output, null, 2);
+  return JSON.stringify(redact ? redactAuditValue(output, redact) : output, null, 2);
 }
 
 // ── CSV Export ───────────────────────────────────────────────────
@@ -91,20 +98,53 @@ export function downloadFile(content: string, filename: string, mimeType: string
  * Export and download audit log as JSON.
  */
 export function downloadAuditJson(logger: AuditLogger, exportedBy: string) {
-  const json = exportAsJson(logger, exportedBy);
+  const through = logger.lastId();
+  const { name, text } = auditJsonFile(logger, exportedBy);
+  downloadFile(text, name, 'application/json');
+  logger.markSaved(through);
+}
+
+/**
+ * The audit log as a named JSON file, for callers that save it
+ * themselves instead of triggering a browser download -- the desktop
+ * app writes it into the export folder next to bids_output/.
+ */
+export function auditJsonFile(logger: AuditLogger, exportedBy: string): { name: string; text: string } {
+  const text = exportAsJson(logger, exportedBy);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  downloadFile(json, `audit_log_${timestamp}.json`, 'application/json');
   logger.logAuditExported('JSON');
+  return { name: `audit_log_${timestamp}.json`, text };
+}
+
+/**
+ * Both audit files written at export: the full log (keep at the site) and
+ * the shareable copy (safe to send with the dataset). Same timestamp, so
+ * the pair is easy to match. `throughId` is the last entry in them: once
+ * the caller has saved the files, it passes it to logger.markSaved().
+ */
+export function auditJsonFiles(
+  logger: AuditLogger,
+  exportedBy: string,
+  redact: RedactionPairs,
+): { full: { name: string; text: string }; shareable: { name: string; text: string }; throughId: number } {
+  const throughId = logger.lastId();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const full = { name: `audit_log_${timestamp}.json`, text: exportAsJson(logger, exportedBy) };
+  const shareable = { name: `audit_log_${timestamp}_shareable.json`, text: exportAsJson(logger, exportedBy, redact) };
+  logger.logAuditExported('JSON');
+  return { full, shareable, throughId };
 }
 
 /**
  * Export and download audit log as CSV.
  */
 export function downloadAuditCsv(logger: AuditLogger, exportedBy: string) {
+  const through = logger.lastId();
   const csv = exportAsCsv(logger, exportedBy);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   downloadFile(csv, `audit_log_${timestamp}.csv`, 'text/csv');
   logger.logAuditExported('CSV');
+  logger.markSaved(through);
 }
 
 // ── Utility ─────────────────────────────────────────────────────

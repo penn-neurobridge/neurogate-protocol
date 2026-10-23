@@ -15,25 +15,10 @@ const DOC_META: Record<string, { title: string; id: string; file: string }> = {
     id: 'SOP-BIDS-001',
     file: '/docs/sop-bids.md',
   },
-  'sop-pennsieve': {
-    title: 'Pennsieve Upload Procedures',
-    id: 'SOP-PENNSIEVE-001',
-    file: '/docs/sop-pennsieve.md',
-  },
-  'sop-redcap': {
-    title: 'REDCap Metadata Entry',
-    id: 'SOP-REDCAP-001',
-    file: '/docs/sop-redcap.md',
-  },
   'sop-gui': {
     title: 'Compliance Tool User Guide',
     id: 'SOP-GUI-001',
     file: '/docs/sop-gui.md',
-  },
-  'onboarding': {
-    title: 'Site Onboarding Checklist',
-    id: 'ONBOARD-001',
-    file: '/docs/onboarding.md',
   },
 };
 
@@ -99,7 +84,7 @@ function TableOfContents({ entries }: { entries: TocEntry[] }) {
           <button
             key={i}
             onClick={() => scrollTo(entry.id)}
-            className="text-xs px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:border-[#011F5B] hover:text-[#011F5B] transition-colors text-gray-600 cursor-pointer"
+            className="btn-cta text-xs px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:border-[#011F5B] hover:text-[#011F5B] transition-colors text-gray-600 cursor-pointer"
           >
             {entry.text}
           </button>
@@ -139,37 +124,35 @@ const headingComponents = buildHeadingComponents();
 /* ═══ MAIN PAGE ═══════════════════════════════════════════════ */
 export default function DocViewerPage() {
   const { docId } = useParams<{ docId: string }>();
-  const [content, setContent] = useState<string>('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
-
   const meta = docId ? DOC_META[docId] : null;
 
+  // The fetched document, tagged with the file it came from, so loading and
+  // error states are derived from it rather than reset inside the effect.
+  const [fetched, setFetched] = useState<{ file: string; text: string | null } | null>(null);
+
   useEffect(() => {
-    if (!meta) {
-      setError(true);
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
-    setError(false);
-
+    if (!meta) return;
+    let cancelled = false;
     fetch(meta.file)
       .then((res) => {
         if (!res.ok) throw new Error('Not found');
         return res.text();
       })
       .then((text) => {
-        setContent(text);
-        setLoading(false);
+        if (cancelled) return;
+        setFetched({ file: meta.file, text });
         window.scrollTo(0, 0);
       })
       .catch(() => {
-        setError(true);
-        setLoading(false);
+        if (!cancelled) setFetched({ file: meta.file, text: null });
       });
+    return () => { cancelled = true; };
   }, [meta]);
+
+  const current = meta && fetched?.file === meta.file ? fetched : null;
+  const loading = Boolean(meta) && !current;
+  const error = !meta || current?.text === null;
+  const content = current?.text ?? '';
 
   const toc = content ? extractToc(content) : [];
 

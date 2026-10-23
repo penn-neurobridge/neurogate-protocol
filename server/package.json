@@ -1,0 +1,12 @@
+{
+  "name": "neurogate-server",
+  "version": "1.0.0",
+  "description": "NeuroGate local page server for the desktop app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

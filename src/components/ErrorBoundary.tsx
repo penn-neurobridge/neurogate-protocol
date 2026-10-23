@@ -71,8 +71,9 @@ export default class ErrorBoundary extends Component<Props, State> {
 
           {/* Description */}
           <p className="text-sm text-gray-500 leading-relaxed mb-8">
-            An unexpected error happened in the app. Reloading the page usually fixes it. If the
-            issue keeps happening, let me know at{' '}
+            An unexpected error happened in the app. Reloading usually fixes it. The audit log is
+            kept, but any metadata you entered is cleared. If the issue keeps happening,
+            let me know at{' '}
             <a
               href="mailto:brandon.bach44@gmail.com"
               className="font-medium no-underline"
@@ -88,7 +89,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             <button
               type="button"
               onClick={this.handleReload}
-              className="inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all"
+              className="btn-cta inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all"
               style={{ backgroundColor: PENN_BLUE, color: '#ffffff' }}
               onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = PENN_BLUE_HOVER)}
               onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = PENN_BLUE)}
