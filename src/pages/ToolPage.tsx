@@ -218,14 +218,85 @@ function ToolPage() {
   }, [audit, datasetStructure]);
 
   // ── Remove a single file from the mapping ────────────────────
+  //
+  // When a data file is removed, its paired companions (JSON sidecar, TSV
+  // metadata, and .bval/.bvec gradient tables) are removed too, because
+  // leaving them in the mapping causes Validate to flag them as orphaned.
+  // Pairing uses the same rule as bidsNaming: same folder + same base name
+  // (stripping extensions including .nii.gz).
+  //
+  // Side effects (audit.addEntry, setSummary) are intentionally outside
+  // the setDetectionResults updater: React may call updater functions
+  // twice in development (Strict Mode), which would double-log removals.
+  // The new list is derived from the current state ref and passed directly
+  // to the state setter, keeping the updater free of side effects.
   const handleRemoveResult = useCallback((index: number) => {
     setDetectionResults(prev => {
-      const removed = prev[index];
-      if (removed && !removedResults.current.includes(removed)) removedResults.current.push(removed);
-      const next = prev.filter((_, i) => i !== index);
+      const primary = prev[index];
+      if (!primary) return prev;
+
+      // ── Helpers (inline, no import needed) ───────────────────────
+      const folderOf = (p: string) => { const s = p.lastIndexOf('/'); return s === -1 ? '' : p.slice(0, s); };
+      const baseOf   = (n: string) => { const l = n.toLowerCase(); if (l.endsWith('.nii.gz')) return n.slice(0, -7); const d = n.lastIndexOf('.'); return d >= 0 ? n.substring(0, d) : n; };
+
+      // ── Identify companions to remove alongside the primary file ──
+      // Companions are sidecar-json / sidecar-tsv files and .bval / .bvec
+      // gradient tables that share the same folder and base name.
+      // Only cascade when primary is itself a data file, so removing a
+      // bare sidecar doesn't pull its image out of the mapping.
+      const primaryModality = getEffectiveModality(primary);
+      const primaryIsData =
+        primaryModality !== 'sidecar-json' &&
+        primaryModality !== 'sidecar-tsv' &&
+        !/\.(bval|bvec)$/i.test(primary.fileName);
+
+      const companionIndices = new Set<number>();
+      if (primaryIsData) {
+        prev.forEach((r, i) => {
+          if (i === index) return;
+          const m = getEffectiveModality(r);
+          const isCompanionType =
+            m === 'sidecar-json' ||
+            m === 'sidecar-tsv' ||
+            /\.(bval|bvec)$/i.test(r.fileName);
+          if (
+            isCompanionType &&
+            folderOf(r.relativePath) === folderOf(primary.relativePath) &&
+            baseOf(r.fileName) === baseOf(primary.fileName)
+          ) {
+            companionIndices.add(i);
+          }
+        });
+      }
+
+      const removeIndices = new Set([index, ...companionIndices]);
+      const toRemove = prev.filter((_, i) => removeIndices.has(i));
+      const next     = prev.filter((_, i) => !removeIndices.has(i));
+
+      // ── Register all removed files for audit-log redaction ────────
+      for (const r of toRemove) {
+        if (!removedResults.current.includes(r)) removedResults.current.push(r);
+      }
+
       const renamed = computeBidsNames(next, undefined, datasetStructure);
-      setSummary(generateSummary(renamed, datasetStructure));
-      if (removed) audit.addEntry('file-removed', `Removed from mapping: ${removed.fileName}`);
+      const newSummary = generateSummary(renamed, datasetStructure);
+
+      // ── Log and update derived state outside the updater ──────────
+      // queueMicrotask defers until after the updater returns, so React
+      // won't see these as part of the render and won't call them a
+      // second time in Strict Mode.
+      queueMicrotask(() => {
+        audit.addEntry('file-removed', `Removed from mapping: ${primary.fileName}`);
+        for (const companion of toRemove) {
+          if (companion === primary) continue;
+          audit.addEntry(
+            'file-removed',
+            `Removed from mapping (paired with ${primary.fileName}): ${companion.fileName}`,
+          );
+        }
+        setSummary(newSummary);
+      });
+
       return renamed;
     });
   }, [audit, datasetStructure]);
