@@ -18,7 +18,7 @@ import { computeBidsNames } from './src/lib/bids/bidsNaming';
 import { generateSummary } from './src/lib/detection';
 import { createAuditLogger } from './src/lib/audit/auditLogger';
 import { auditJsonFiles, buildAuditRedactionPairs } from './src/lib/audit';
-import { getEffectiveModality, getEffectiveSession } from './src/types/detection';
+import { getEffectiveModality } from './src/types/detection';
 import type { DetectionResult, Modality } from './src/types/detection';
 import { createDefaultDatasetStructure } from './src/types/sessionStructure';
 
