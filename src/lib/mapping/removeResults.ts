@@ -11,6 +11,7 @@
  */
 
 import type { DetectionResult } from '../../types/detection';
+import { getEffectiveModality } from '../../types/detection';
 
 /** Files that travel with a primary when it is removed. */
 const COMPANION_MODALITIES = new Set(['sidecar-json', 'sidecar-tsv', 'gradient-bval', 'gradient-bvec']);
@@ -28,7 +29,7 @@ function baseName(fileName: string): string {
 /** True when `candidate` is a companion of `primary` (same folder, same base name, companion modality). */
 function isCompanionOf(candidate: DetectionResult, primary: DetectionResult): boolean {
   return (
-    COMPANION_MODALITIES.has(candidate.modality ?? '') &&
+    COMPANION_MODALITIES.has(getEffectiveModality(candidate)) &&
     folderOf(candidate.relativePath) === folderOf(primary.relativePath) &&
     baseName(candidate.fileName) === baseName(primary.fileName)
   );

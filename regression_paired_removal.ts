@@ -26,18 +26,19 @@ function check(ok: boolean, detail: string) {
 /** Minimal DetectionResult stub. */
 function mk(
   relativePath: string,
-  modality: string,
+  detectedModality: string,
 ): DetectionResult {
   const fileName = relativePath.split('/').pop()!;
   return {
     relativePath,
     fileName,
-    modality,
+    detectedModality,
     confidence: 'high',
     subjectGroup: 'S',
     session: null,
-    userSession: undefined,
-    userModality: undefined,
+    userSession: null,
+    userModality: null,
+    userSubjectGroup: null,
     bidsFilename: fileName,
     bidsPath: fileName,
     duplicateOf: null,
